@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+# local generated fixtures
+fixtures/**/bin/
+fixtures/**/obj/
+fixtures/**/fixture.manifest.json
+# patched/generated binaries
+*.patched
+*.patched.exe
+
+# local downloaded challenge/test corpora
+challenges/
+challenge_test_report.md

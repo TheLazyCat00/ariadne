@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# enter.sh
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+export PATH="$SCRIPT_DIR/bin:$PATH"
+if [ -f "$SCRIPT_DIR/.venv/bin/activate" ]; then
+	. "$SCRIPT_DIR/.venv/bin/activate"
+fi
+
+echo "ariadne devshell — ariadne and venv active. type 'exit' to leave."
+exec "${SHELL:-bash}"
