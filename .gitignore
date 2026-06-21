@@ -15,6 +15,7 @@ dist/
 fixtures/**/bin/
 fixtures/**/obj/
 fixtures/**/fixture.manifest.json
+fixtures/native_gate_demo/native_gate_demo
 # patched/generated binaries
 *.patched
 *.patched.exe

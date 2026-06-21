@@ -11,9 +11,9 @@ native ELF/PE            -> angr call-tree backend
 future runtimes          -> dedicated frontend modules
 ```
 
-See [`RESEARCH_INTENT.md`](RESEARCH_INTENT.md) for the project’s intended use,
-ethical boundaries, and fixture-manifest model. This project is intended for
-authorized research, education, defensive auditing, and owned/CTF/lab fixtures.
+See [`RESEARCH_INTENT.md`](RESEARCH_INTENT.md) for the project’s intended use and
+ethical boundaries. This project is intended for
+authorized research, education, defensive auditing, and owned/CTF/lab applications.
 It is not intended for piracy, unauthorized license circumvention, or patched
 third-party software distribution.
 
@@ -24,9 +24,7 @@ main.py                             # main CLI entrypoint
 calltree_backends/
   native_angr.py                    # native angr backend
   dotnet_il.py                      # .NET IL frontend
-  fixture.py                        # fixture manifest verification
-fixtures/dotnet_il_gate_demo/       # owned/generated .NET IL test fixture
-uploads/calltree_triage_new.py      # compatibility wrapper for old filename
+  outcomes.py                       # shared win/lose string heuristics
 ```
 
 ## Install dependencies
@@ -37,16 +35,10 @@ Core native backend:
 python -m pip install angr networkx
 ```
 
-.NET IL metadata frontend:
+.NET IL metadata/frontend solver:
 
 ```bash
-python -m pip install dnfile
-```
-
-The .NET demo fixture requires a local .NET SDK only if you want to build it:
-
-```bash
-dotnet --version
+python -m pip install dnfile z3-solver
 ```
 
 ## Usage
@@ -81,34 +73,21 @@ Dump IL and print a non-destructive patch plan:
 python main.py ./App.dll \
   --frontend dotnet-il \
   --mode advise \
-  --il-method CheckLabKey \
+  --method CheckLabKey \
   --il-dump \
   --il-plan-patch
 ```
 
-## Fixture workflow
+Shared patch flags:
 
-Build the owned .NET IL fixture:
-
-```bash
-cd fixtures/dotnet_il_gate_demo
-dotnet build -c Release
-python create_manifest.py
+```text
+--method REGEX_OR_ADDR       backend-neutral method/function selector
+--return-patch               patch/plan a function or method return override
+--patch-return auto|...      infer by default, or force true/false/zero/one
+--write-patch                actually write a patched copy
 ```
 
-Then run from the repository root:
-
-```bash
-python main.py \
-  fixtures/dotnet_il_gate_demo/bin/Release/net8.0/GateDemo.dll \
-  --frontend dotnet-il \
-  --mode solve \
-  --il-method CheckLabKey \
-  --fixture-manifest fixtures/dotnet_il_gate_demo/fixture.manifest.json
-```
-
-Patch mode for .NET IL is currently dry-run only: it emits an IL branch rewrite
-plan and does not write a modified assembly.
+Without `--write-patch`, patch-capable backends print dry-run plans where possible.
 
 ## License
 

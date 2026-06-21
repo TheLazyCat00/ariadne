@@ -97,11 +97,7 @@ def obj_of(proj, addr):
     b=(getattr(o,"binary","") or "?").rsplit("/",1)[-1]
     return (b, o is proj.loader.main_object)
 
-WIN_WORDS=["correct","granted","welcome","success","unlocked","accepted",
-           "licensed","thank you","notes","access granted"]
-LOSE_WORDS=["wrong","denied","invalid","incorrect","not correct","not valid",
-            "fail","failed","nope","unregistered","unlicensed","locked",
-            "not registered","try again","bad "]
+from calltree_backends.outcomes import WIN_WORDS, LOSE_WORDS, classify_strings
 
 # ---------------------------------------------------------------------------
 # OS-keyed source table. This is the ONLY place the pipeline branches on OS.
@@ -389,8 +385,7 @@ def detect_runtime(proj, cfg, binary, os_, files, envs, regs):
 def runtime_frontend_hint(kind):
     if kind.startswith("dotnet"):
         return ("Use a .NET/IL frontend: parse CLI metadata, build an IL-level CFG, "
-                "model Console/Environment/File/Registry APIs, and solve at IL level. "
-                "Triton is best kept for small native/AOT/JIT helper snippets, not CoreCLR startup.")
+                "model Console/Environment/File/Registry APIs, and solve at IL level. ")
     if kind=="java-launcher":
         return ("Use a JVM bytecode frontend: analyze .class/.jar methods and model Java APIs; "
                 "native launcher branches are usually JVM bootstrap noise.")
@@ -734,12 +729,12 @@ def _out_for_object(obj, out_arg, n_objs, used):
         i+=1
 
 def apply_branch_patches(proj, decisions, out_arg=None, title=None,
-                         empty_msg="no conditional branches selected"):
+                         empty_msg="no conditional branches selected", dry_run=False):
     """Group selected branch patches by owning object and write one patched
     file per object. `decisions` is an iterable of (capstone_jump, take_jump).
     This is shared by the string-sink multi-branch patcher and the dominance
     gate fallback so selection and patch target cannot diverge."""
-    if title: hr(title)
+    if title: hr(title + (" (dry-run)" if dry_run else ""))
     decisions=list(decisions or [])
     if not decisions:
         print("  %s" % empty_msg); return False
@@ -789,10 +784,14 @@ def apply_branch_patches(proj, decisions, out_arg=None, title=None,
         out=_out_for_object(obj, out_arg, len(groups), used_out)
         parent=os.path.dirname(out)
         if parent: os.makedirs(parent, exist_ok=True)
-        open(out,"wb").write(data)
-        print("    wrote %s with %d branch patch(es) (original untouched)"
-              % (out, applied))
-        if not is_main:
+        if dry_run:
+            print("    would write %s with %d branch patch(es) (original untouched)"
+                  % (out, applied))
+        else:
+            open(out,"wb").write(data)
+            print("    wrote %s with %d branch patch(es) (original untouched)"
+                  % (out, applied))
+        if (not dry_run) and not is_main:
             print("    NB: to use it, replace the library the app loads with %s"
                   " (e.g. copy over %s next to the app)." % (out, nm))
         total_applied+=applied; objects_written+=1
@@ -803,12 +802,12 @@ def apply_branch_patches(proj, decisions, out_arg=None, title=None,
           % (total_applied, objects_written))
     return total_applied>0
 
-def patch(proj, cfg, win, lose, src=None, out_arg=None, title=None):
+def patch(proj, cfg, win, lose, src=None, out_arg=None, title=None, dry_run=False):
     decs=find_decisions(proj, cfg, win, lose)
     return apply_branch_patches(
         proj, decs, out_arg,
         title=title or "PATCH (uniform: neutralize every failure branch on the call tree)",
-        empty_msg="no failure-only conditional branches isolated")
+        empty_msg="no failure-only conditional branches isolated", dry_run=dry_run)
 
 # ---------------------------------------------------------------------------
 
@@ -889,7 +888,7 @@ def find_gate_dominance(proj, cfg):
             "win_blocks":big,"lose_blocks":small,"pct":big/total,"total":total,
             "depth":depth,"n_gates":len(cands)}
 
-def patch_gate(proj, gate, src=None, out_arg=None):
+def patch_gate(proj, gate, src=None, out_arg=None, dry_run=False):
     hr("PATCH (force the dominance gate toward the unlocked side)")
     jmp=gate["jmp"]
     try: jtarget=int(jmp.op_str,16)
@@ -899,7 +898,7 @@ def patch_gate(proj, gate, src=None, out_arg=None):
           (jmp.mnemonic, jmp.address, "TAKE" if take else "SKIP"))
     return apply_branch_patches(
         proj, [(jmp,take)], out_arg,
-        empty_msg="no dominance gate branch selected")
+        empty_msg="no dominance gate branch selected", dry_run=dry_run)
 
 
 
@@ -1005,14 +1004,229 @@ class NativeAngrFrontend:
         solve(self.proj,self.cfg,solve_win,lose,self.files,self.envs,self.regs,self.binary,os_=self.os_)
         return True
 
-    def patch(self, out_arg=None, force_low_confidence=False):
+    def _find_native_functions(self, pattern):
+        import re
+        if not pattern: return []
+        try:
+            if pattern.lower().startswith("0x"):
+                addr=int(pattern,16)
+                f=self.cfg.functions.floor_func(addr)
+                return [f] if f is not None else []
+        except Exception: pass
+        out=[]
+        try: rx=re.compile(pattern,re.I)
+        except Exception: rx=None
+        for f in self.cfg.functions.values():
+            nm=getattr(f,"name","") or ""
+            if (rx and rx.search(nm)) or ((not rx) and pattern.lower() in nm.lower()):
+                if _is_ours(self.proj,f.addr): out.append(f)
+        return out
+
+    def _native_block_strings(self):
+        if hasattr(self,"_block_string_cache"): return self._block_string_cache
+        refs=rip_ref_index(self.proj,self.cfg); out={}
+        for o in self.proj.loader.all_objects:
+            for seg in getattr(o,"segments",[]):
+                try: data=self.proj.loader.memory.load(seg.vaddr,seg.memsize)
+                except Exception: continue
+                i=0
+                while i<len(data):
+                    j=data.find(b"\x00",i)
+                    if j==-1: break
+                    s=data[i:j]
+                    if 3<=len(s)<=160 and all(32<=c<127 for c in s):
+                        txt=s.decode("latin1","replace")
+                        for b in refs.get(seg.vaddr+i,()): out.setdefault(b,[]).append(txt)
+                    i=j+1
+        self._block_string_cache=out
+        return out
+
+    def _classify_native_strings(self, strings):
+        wins=[]; loses=[]
+        for st in strings:
+            low=st.lower()
+            if any(w in low for w in LOSE_WORDS): loses.append(st)
+            elif any(w in low for w in WIN_WORDS): wins.append(st)
+        return wins,loses
+
+    def _node_score(self, node):
+        if node is None: return 0.0
+        try: reachset=_reach(self.cfg.graph,node)
+        except Exception: reachset={node}
+        ours=sum(1 for n in reachset if _is_ours(self.proj,n.addr))
+        win_bonus=lose_penalty=0
+        try:
+            bstr=self._native_block_strings(); strings=[]
+            for n in reachset: strings += bstr.get(n.addr,[])
+            wins,loses=self._classify_native_strings(strings)
+            win_bonus += 10000*len(wins); lose_penalty += 10000*len(loses)
+        except Exception: pass
+        try:
+            if self.sink_win is None or self.sink_lose is None:
+                self.sink_win,self.sink_lose,_seen=outcome_sinks(self.proj,self.cfg)
+            if any(n.addr in (self.sink_win or set()) for n in reachset): win_bonus+=10000
+            if any(n.addr in (self.sink_lose or set()) for n in reachset): lose_penalty+=10000
+        except Exception: pass
+        return float(ours + win_bonus - lose_penalty)
+
+    def _branch_sides_for_return(self, jcc, pred_ins):
+        """Return (zero_side_addr, nonzero_side_addr) for test/cmp eax,0; jcc."""
+        mn=jcc.mnemonic.lower(); op=jcc.op_str.strip()
+        if mn not in ("je","jz","jne","jnz"): return None
+        try: target=int(op,16)
+        except Exception: return None
+        fall=jcc.address+jcc.size
+        pm=pred_ins.mnemonic.lower(); po=pred_ins.op_str.lower().replace(" ","")
+        # test eax,eax / test rax,rax
+        is_zero_test=(pm=="test" and po in ("eax,eax","rax,rax","al,al"))
+        # cmp eax,0 / cmp rax,0 / cmp al,0
+        is_zero_cmp=(pm=="cmp" and po in ("eax,0","rax,0","al,0","eax,0x0","rax,0x0","al,0x0"))
+        if not (is_zero_test or is_zero_cmp): return None
+        if mn in ("je","jz"):
+            return target, fall
+        return fall, target
+
+    def _insn_string_refs(self, ins):
+        out=[]
+        if "rip +" not in ins.op_str: return out
+        try:
+            disp=int(ins.op_str.split("rip +")[1].split("]")[0].strip(),16)
+            tgt=ins.address+ins.size+disp
+            raw=read_cstr(self.proj,tgt)
+            if raw: out.append(raw.decode("latin1","replace"))
+        except Exception: pass
+        return out
+
+    def _linear_insn_side_score(self, insns, start_idx, max_steps=48):
+        addr_to_idx={ins.address:i for i,ins in enumerate(insns)}
+        i=start_idx; strings=[]; count=0; seen=set()
+        while 0 <= i < len(insns) and count<max_steps and i not in seen:
+            seen.add(i); count+=1
+            ins=insns[i]; mn=ins.mnemonic.lower()
+            strings += self._insn_string_refs(ins)
+            if mn=="ret": break
+            if mn=="jmp":
+                try: i=addr_to_idx.get(int(ins.op_str,16), i+1); continue
+                except Exception: break
+            if mn.startswith("j") and mn!="jmp":
+                # Do not explore nested branches here; this is a local side
+                # heuristic for the immediate caller branch after a return check.
+                i+=1; continue
+            i+=1
+        wins,loses=self._classify_native_strings(strings)
+        return {"score":10000*len(wins)-10000*len(loses)+count/100.0,
+                "wins":wins,"loses":loses,"count":count}
+
+    def _infer_native_return_value(self, f):
+        zero_score=one_score=0.0; reasons=[]
+        for caller in self.cfg.functions.values():
+            if not _is_ours(self.proj,caller.addr): continue
+            try: blocks=list(caller.blocks)
+            except Exception: continue
+            by_addr={}
+            for blk in blocks:
+                for ins in blk.capstone.insns:
+                    by_addr.setdefault(ins.address, ins)
+            insns=[by_addr[a] for a in sorted(by_addr)]
+            for i,ins in enumerate(insns):
+                    if ins.mnemonic.lower()!="call": continue
+                    try: tgt=int(ins.op_str,16)
+                    except Exception: continue
+                    if tgt!=f.addr: continue
+                    # Common shape: call check; test/cmp eax,0; je/jne side
+                    window=insns[i+1:i+5]
+                    for k in range(len(window)-1):
+                        sides=self._branch_sides_for_return(window[k+1], window[k])
+                        if not sides: continue
+                        zaddr,oaddr=sides
+                        addr_to_idx={ii.address:jj for jj,ii in enumerate(insns)}
+                        zs=self._linear_insn_side_score(insns, addr_to_idx.get(zaddr, i+1))["score"]
+                        os_=self._linear_insn_side_score(insns, addr_to_idx.get(oaddr, i+1))["score"]
+                        # If local side scoring is inconclusive, fall back to CFG reachability.
+                        if zs==os_:
+                            znode=self.cfg.model.get_any_node(zaddr)
+                            onode=self.cfg.model.get_any_node(oaddr)
+                            zs=self._node_score(znode); os_=self._node_score(onode)
+                        zero_score+=zs; one_score+=os_
+                        reasons.append("caller %s call@%#x %s@%#x: zero->%#x score=%.1f nonzero->%#x score=%.1f" %
+                                       (caller.name, ins.address, window[k+1].mnemonic, window[k+1].address,
+                                        zaddr, zs, oaddr, os_))
+                        break
+        print("  native return inference for %s @ %#x:" % (f.name,f.addr))
+        print("    zero/non-success score : %.2f" % zero_score)
+        print("    nonzero/success score  : %.2f" % one_score)
+        for r in reasons[:12]: print("    - "+r)
+        if zero_score==one_score:
+            return None
+        return 1 if one_score>zero_score else 0
+
+    def _write_native_return_stub(self, f, out_arg=None, ret_value="auto"):
+        if ret_value=="auto":
+            rv=self._infer_native_return_value(f)
+            if rv is None:
+                print("  native return patch: could not infer return value; rerun with --native-patch-return zero|one")
+                return False
+        else:
+            rv=1 if ret_value in ("one","nonzero","true") else 0
+        obj,why=_patchable_object(self.proj,f.addr,"function")
+        if why:
+            print("  native return patch: %s" % why); return False
+        binpath=getattr(obj,"binary","") or ""; nm=_obj_basename(obj)
+        off=obj.addr_to_offset(f.addr)
+        if off is None:
+            print("  native return patch: could not map function %#x to file offset" % f.addr); return False
+        data=bytearray(open(binpath,"rb").read())
+        stub=(b"\x31\xc0\xc3" if rv==0 else b"\xb8\x01\x00\x00\x00\xc3")
+        # Patch only if the first block is large enough; avoids overwriting file
+        # bytes beyond the basic block. Function.size is not reliable for this.
+        try: first_block=self.proj.factory.block(f.addr).size
+        except Exception: first_block=0
+        if first_block < len(stub):
+            print("  native return patch: first block too small for return stub (%d < %d)" % (first_block,len(stub)))
+            return False
+        data[off:off+len(stub)]=stub
+        # NOP remaining bytes in the original first block prefix only when small.
+        for i in range(off+len(stub), off+min(first_block,16)): data[i]=0x90
+        out=out_arg or (nm+".%s.return%d.patched"%(f.name,rv))
+        parent=os.path.dirname(out)
+        if parent: os.makedirs(parent,exist_ok=True)
+        open(out,"wb").write(data)
+        print("  native return patch: %s @ %#x -> return %d" % (f.name,f.addr,rv))
+        print("  wrote %s (original untouched)" % out)
+        return True
+
+    def patch_return_function(self, function_filter, out_arg=None, ret_value="auto", write_patch=False):
+        hr("PATCH (native function return override%s)" % ("" if write_patch else " dry-run"))
+        matches=self._find_native_functions(function_filter)
+        if not matches:
+            print("  no matching owned function for --native-function %r" % function_filter); return False
+        if len(matches)!=1:
+            print("  refusing: --native-function matched %d functions; use an exact name or address" % len(matches))
+            for f in matches[:20]: print("    - %s @ %#x" % (f.name,f.addr))
+            return False
+        f=matches[0]
+        # Always infer/report first. Only write when explicitly enabled
+        inferred = self._infer_native_return_value(f) if ret_value=="auto" else (1 if ret_value=="one" else 0)
+        if inferred is None:
+            print("  native return patch: could not infer return value; rerun with --native-patch-return zero|one")
+            return False
+        if not write_patch:
+            print("  dry-run: would patch %s @ %#x to return %d" % (f.name,f.addr,inferred))
+            print("  add --write-patch to write a patched copy")
+            return True
+        return self._write_native_return_stub(f, out_arg=out_arg, ret_value=("one" if inferred else "zero"))
+
+    def patch(self, out_arg=None, force_low_confidence=False, write_patch=False):
+        dry_run=not write_patch
+        if not write_patch:
+            print("  native patch write disabled; printing dry-run patch plan (add --write-patch to write)")
         gate,low_conf,no_gate=self._print_gate_report()
         if no_gate:
             self.sink_win,self.sink_lose,_seen=outcome_sinks(self.proj,self.cfg)
             if self.sink_win or self.sink_lose:
                 print("  outcome sinks: win=%d lose=%d" % (len(self.sink_win or ()), len(self.sink_lose or ())))
                 return patch(self.proj,self.cfg,self.sink_win or set(),self.sink_lose or set(),self.binary,out_arg,
-                             title="PATCH (outcome sinks: neutralize every failure-only branch)")
+                             title="PATCH (outcome sinks: neutralize every failure-only branch)", dry_run=dry_run)
             hr("PATCH (uniform: neutralize every failure branch on the call tree)")
             print("  no win/lose outcome sinks identified; cannot select failure-only branches")
             print(); return False
@@ -1025,15 +1239,15 @@ class NativeAngrFrontend:
         if self.sink_win or self.sink_lose:
             print("  outcome sinks: win=%d lose=%d" % (len(self.sink_win or ()), len(self.sink_lose or ())))
             patched=patch(self.proj,self.cfg,self.sink_win or set(),self.sink_lose or set(),self.binary,out_arg,
-                          title="PATCH (outcome sinks: neutralize every failure-only branch)")
+                          title="PATCH (outcome sinks: neutralize every failure-only branch)", dry_run=dry_run)
             if not patched:
                 print("  falling back to dominance-derived branch selection")
         else:
             print("  no win/lose outcome sinks identified; using dominance-derived branch selection")
         if not patched:
             patched=patch(self.proj,self.cfg,{gate["win"]},{gate["lose"]},self.binary,out_arg,
-                          title="PATCH (dominance: neutralize every branch to the rejected side)")
+                          title="PATCH (dominance: neutralize every branch to the rejected side)", dry_run=dry_run)
         if not patched:
             print("  falling back to the single dominance gate patch")
-            patched=patch_gate(self.proj,gate,self.binary,out_arg)
+            patched=patch_gate(self.proj,gate,self.binary,out_arg,dry_run=dry_run)
         return patched

@@ -1,3 +1,4 @@
 angr
 networkx
 dnfile
+z3-solver

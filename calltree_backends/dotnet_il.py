@@ -2,17 +2,14 @@
 """Standalone .NET IL frontend for Ariadne.
 
 This backend is intentionally managed-code-aware. It analyzes CLI metadata and
-CIL directly instead of asking angr/Triton to execute CoreCLR bootstrap code.
-Write-capable patching is not implemented here; patch mode emits dry-run plans.
+CIL directly instead of asking angr to execute CoreCLR bootstrap code.
+Patch mode emits dry-run plans by default; write-capable method-body replacement
+is opt-in
 """
 import os
 import sys
 
-WIN_WORDS=["correct","granted","welcome","success","unlocked","accepted",
-           "licensed","thank you","notes","access granted"]
-LOSE_WORDS=["wrong","denied","invalid","incorrect","not correct","not valid",
-            "fail","failed","nope","unregistered","unlicensed","locked",
-            "not registered","try again","bad "]
+from calltree_backends.outcomes import WIN_WORDS, LOSE_WORDS, classify_strings
 
 def hr(t): print("\n"+"="*66+"\n  "+t+"\n"+"="*66)
 
@@ -239,7 +236,7 @@ def _decode_cil(code, pe=None):
                     "target":target,"text":text})
     return out
 
-def _method_il_bytes(pe, mrow):
+def _method_body_info(pe, mrow):
     try: rva=int(mrow.Rva)
     except Exception:
         try: rva=int(mrow.RVA)
@@ -253,7 +250,9 @@ def _method_il_bytes(pe, mrow):
         # Tiny header: low two bits == 2, code size in upper six bits.
         if (b0 & 0x3)==0x2:
             sz=b0>>2
-            return data[off+1:off+1+sz]
+            return {"rva":rva,"header_off":off,"code_off":off+1,"code_size":sz,
+                    "header_size":1,"tiny":True,"more_sects":False,
+                    "code":data[off+1:off+1+sz]}
         # Fat header: low two bits == 3, header size in dwords in high nibble.
         import struct
         flags_size=struct.unpack_from("<H",data,off)[0]
@@ -261,9 +260,16 @@ def _method_il_bytes(pe, mrow):
         hdr_dwords=(flags_size >> 12) & 0xf
         hdr_size=hdr_dwords*4
         code_size=struct.unpack_from("<I",data,off+4)[0]
-        return data[off+hdr_size:off+hdr_size+code_size]
+        return {"rva":rva,"header_off":off,"code_off":off+hdr_size,
+                "code_size":code_size,"header_size":hdr_size,"tiny":False,
+                "more_sects":bool(flags_size & 0x8),
+                "code":data[off+hdr_size:off+hdr_size+code_size]}
     except Exception:
         return None
+
+def _method_il_bytes(pe, mrow):
+    info=_method_body_info(pe,mrow)
+    return info.get("code") if info else None
 
 class DotNetILFrontend:
     """Runtime-specific frontend for managed .NET assemblies.
@@ -279,9 +285,11 @@ class DotNetILFrontend:
     SINK_CALLS=("Console::WriteLine","MessageBox::Show","Environment::Exit")
 
     def __init__(self, binary, rt=None, explicit_assembly=None, method_filter=None,
-                 il_dump=False, il_plan_patch=False):
+                 il_dump=False, il_plan_patch=False, il_write_patch=False,
+                 il_patch_return="auto"):
         self.binary=binary; self.rt=rt or {}; self.explicit_assembly=explicit_assembly
         self.method_filter=method_filter; self.il_dump=il_dump; self.il_plan_patch=il_plan_patch
+        self.il_write_patch=il_write_patch; self.il_patch_return=il_patch_return
         self.assemblies=_dotnet_payload_candidates(binary,self.rt, explicit=explicit_assembly)
         self.primary=self.assemblies[0] if self.assemblies else None
         self.pe=None; self.dnfile_error=None; self.raw=[]; self.methods=[]
@@ -312,13 +320,14 @@ class DotNetILFrontend:
         except Exception: return out
         for idx,m in enumerate(rows[:limit],1):
             name=_safe_name(getattr(m,"Name",None)) or ("method_%d"%idx)
-            code=_method_il_bytes(self.pe,m)
-            if not code: continue
+            body=_method_body_info(self.pe,m)
+            if not body or not body.get("code"): continue
+            code=body["code"]
             ins=_decode_cil(code,self.pe)
             strings=[x["text"] for x in ins if x["op"]=="ldstr" and x.get("text")]
             calls=[x["text"] for x in ins if x["op"] in ("call","callvirt","newobj") and x.get("text")]
-            if strings or calls:
-                out.append({"name":name,"strings":strings,"calls":calls,"ins":ins})
+            if strings or calls or any(x["op"].startswith(("br","bne","beq")) for x in ins):
+                out.append({"name":name,"row":m,"body":body,"strings":strings,"calls":calls,"ins":ins})
         return out
 
     def _looks_like_identifier_noise(self, st):
@@ -485,6 +494,230 @@ class DotNetILFrontend:
         print("  note             : this frontend handles managed IL; native angr remains the frontend for non-IL targets")
         return ok
 
+    def _v_int(self,n): return {"k":"int","v":int(n)}
+    def _v_str(self,s): return {"k":"str","v":s}
+    def _v_symstr(self,name="arg0"): return {"k":"symstr","name":name}
+    def _v_strlen(self,s): return {"k":"strlen","s":s}
+    def _v_char(self,s,i): return {"k":"char","s":s,"i":i}
+    def _v_xor(self,a,b): return {"k":"xor","a":a,"b":b}
+    def _v_cond(self,op,*args): return {"k":"cond","op":op,"args":args}
+
+    def _is_true_const(self,v): return v and v.get("k")=="int" and int(v.get("v",0))!=0
+    def _is_false_const(self,v): return v and v.get("k")=="int" and int(v.get("v",0))==0
+
+    def _copy_state(self,st):
+        return {"pc":st["pc"], "stack":list(st["stack"]), "locals":dict(st["locals"]),
+                "constraints":list(st["constraints"]), "steps":st.get("steps",0)}
+
+    def _add_cond(self,st,cond,truth=True):
+        if cond is None: return False
+        if cond.get("k")=="int":
+            return (truth and self._is_true_const(cond)) or ((not truth) and self._is_false_const(cond))
+        if cond.get("k")!="cond":
+            st["constraints"].append(("truthy" if truth else "falsy", cond)); return True
+        op=cond["op"]; args=cond["args"]
+        if op=="not": return self._add_cond(st,args[0],not truth)
+        if op=="isnullorempty":
+            s=args[0]
+            st["constraints"].append(("len_eq" if truth else "len_ne", s, 0)); return True
+        if op=="startswith":
+            st["constraints"].append(("prefix" if truth else "not_prefix", args[0], args[1])); return True
+        if op=="endswith":
+            st["constraints"].append(("suffix" if truth else "not_suffix", args[0], args[1])); return True
+        if op=="streq":
+            st["constraints"].append(("str_eq" if truth else "str_ne", args[0], args[1])); return True
+        if op=="eq":
+            st["constraints"].append(("expr_eq" if truth else "expr_ne", args[0], args[1])); return True
+        st["constraints"].append(("cond" if truth else "not_cond", cond)); return True
+
+    def _pop(self,st,default=None):
+        return st["stack"].pop() if st["stack"] else default
+
+    def _call_model(self, name, st):
+        # Known methods only. Unknown calls are treated conservatively as no-op;
+        lname=(name or "").lower()
+        if "console::writeline" in lname or "console::write" in lname:
+            self._pop(st); return None
+        if "string::isnullorempty" in lname:
+            s=self._pop(st,self._v_symstr()); st["stack"].append(self._v_cond("isnullorempty",s)); return None
+        if "string::get_length" in lname:
+            s=self._pop(st,self._v_symstr()); st["stack"].append(self._v_strlen(s)); return None
+        if "string::get_chars" in lname:
+            idx=self._pop(st,self._v_int(0)); s=self._pop(st,self._v_symstr())
+            st["stack"].append(self._v_char(s,idx)); return None
+        if "string::startswith" in lname:
+            prefix=self._pop(st,self._v_str("")); s=self._pop(st,self._v_symstr())
+            st["stack"].append(self._v_cond("startswith",s,prefix)); return None
+        if "string::endswith" in lname:
+            suffix=self._pop(st,self._v_str("")); s=self._pop(st,self._v_symstr())
+            st["stack"].append(self._v_cond("endswith",s,suffix)); return None
+        if "string::op_equality" in lname or "string::equals" in lname or lname.endswith("::equals"):
+            b=self._pop(st,self._v_str("")); a=self._pop(st,self._v_symstr())
+            if (a or {}).get("k") in ("symstr","str") or (b or {}).get("k") in ("symstr","str"):
+                st["stack"].append(self._v_cond("streq",a,b))
+            else:
+                st["stack"].append(self._v_cond("eq",a,b))
+            return None
+        return None
+
+    def _execute_symbolic_method(self,m,max_paths=64,max_steps=800,max_len=96):
+        ins=m["ins"]; off_to_idx={x["off"]:i for i,x in enumerate(ins)}
+        init={"pc":0,"stack":[],"locals":{},"constraints":[],"steps":0}
+        solutions=[]; work=[init]
+        while work and len(solutions)<8:
+            st=work.pop()
+            while 0 <= st["pc"] < len(ins) and st.get("steps",0)<max_steps:
+                st["steps"]=st.get("steps",0)+1
+                x=ins[st["pc"]]; op=x["op"]; npc=st["pc"]+1
+                if op=="nop": st["pc"]=npc; continue
+                if op.startswith("ldarg"):
+                    # Treat arg0 as the symbolic input string. Other args become symbolic strings too.
+                    idx=0
+                    if op in ("ldarg.1","ldarg.2","ldarg.3"): idx=int(op[-1])
+                    elif op=="ldarg.s": idx=int(x.get("operand") or 0)
+                    st["stack"].append(self._v_symstr("arg%d"%idx)); st["pc"]=npc; continue
+                if op.startswith("ldloc"):
+                    idx=op.split(".")[-1] if op!="ldloc.s" else str(x.get("operand") or 0)
+                    st["stack"].append(st["locals"].get(idx,self._v_int(0))); st["pc"]=npc; continue
+                if op.startswith("stloc"):
+                    idx=op.split(".")[-1] if op!="stloc.s" else str(x.get("operand") or 0)
+                    st["locals"][idx]=self._pop(st,self._v_int(0)); st["pc"]=npc; continue
+                if op=="ldstr": st["stack"].append(self._v_str(x.get("text") or "")); st["pc"]=npc; continue
+                if op.startswith("ldc.i4"):
+                    vals={"ldc.i4.m1":-1,"ldc.i4.0":0,"ldc.i4.1":1,"ldc.i4.2":2,"ldc.i4.3":3,"ldc.i4.4":4,
+                          "ldc.i4.5":5,"ldc.i4.6":6,"ldc.i4.7":7,"ldc.i4.8":8}
+                    st["stack"].append(self._v_int(vals.get(op,x.get("operand") or 0))); st["pc"]=npc; continue
+                if op in ("call","callvirt","newobj"):
+                    self._call_model(x.get("text"),st); st["pc"]=npc; continue
+                if op=="dup":
+                    if st["stack"]: st["stack"].append(st["stack"][-1])
+                    st["pc"]=npc; continue
+                if op=="pop": self._pop(st); st["pc"]=npc; continue
+                if op=="xor":
+                    b=self._pop(st,self._v_int(0)); a=self._pop(st,self._v_int(0)); st["stack"].append(self._v_xor(a,b)); st["pc"]=npc; continue
+                if op in ("add","sub","mul","and","or"):
+                    b=self._pop(st,self._v_int(0)); a=self._pop(st,self._v_int(0)); st["stack"].append({"k":op,"a":a,"b":b}); st["pc"]=npc; continue
+                if op=="ceq":
+                    b=self._pop(st,self._v_int(0)); a=self._pop(st,self._v_int(0)); st["stack"].append(self._v_cond("eq",a,b)); st["pc"]=npc; continue
+                if op in ("br.s","br"):
+                    tgt=x.get("target"); st["pc"]=off_to_idx.get(tgt,npc); continue
+                if op.startswith("brtrue") or op.startswith("brfalse"):
+                    cond=self._pop(st,self._v_int(0)); tgt=x.get("target")
+                    true_st=self._copy_state(st); false_st=self._copy_state(st)
+                    if self._add_cond(true_st,cond,True):
+                        true_st["pc"]=off_to_idx.get(tgt,npc) if op.startswith("brtrue") else npc
+                        work.append(true_st)
+                    if self._add_cond(false_st,cond,False):
+                        false_st["pc"]=npc if op.startswith("brtrue") else off_to_idx.get(tgt,npc)
+                        work.append(false_st)
+                    break
+                if op in ("beq","beq.s","bne.un","bne.un.s"):
+                    b=self._pop(st,self._v_int(0)); a=self._pop(st,self._v_int(0)); cond=self._v_cond("eq",a,b); tgt=x.get("target")
+                    target_on_eq=op.startswith("beq")
+                    eq_st=self._copy_state(st); ne_st=self._copy_state(st)
+                    if self._add_cond(eq_st,cond,True):
+                        eq_st["pc"]=off_to_idx.get(tgt,npc) if target_on_eq else npc; work.append(eq_st)
+                    if self._add_cond(ne_st,cond,False):
+                        ne_st["pc"]=npc if target_on_eq else off_to_idx.get(tgt,npc); work.append(ne_st)
+                    break
+                if op=="ret":
+                    rv=self._pop(st,self._v_int(0))
+                    if self._is_true_const(rv):
+                        sol=self._solve_constraints(st["constraints"],max_len=max_len)
+                        if sol: solutions.append(sol)
+                    break
+                st["pc"]=npc
+            if len(work)>max_paths: work=work[-max_paths:]
+        return solutions
+
+    def _constraint_known_len(self,constraints,name="arg0"):
+        for c in constraints:
+            if c[0]=="len_eq" and c[1].get("k")=="symstr" and c[1].get("name")==name:
+                try: return int(c[2])
+                except Exception: pass
+            if c[0]=="expr_eq":
+                a,b=c[1],c[2]
+                for x,y in ((a,b),(b,a)):
+                    if x.get("k")=="strlen" and x["s"].get("name")==name and y.get("k")=="int": return int(y["v"])
+        return None
+
+    def _solve_constraints(self,constraints,max_len=96):
+        try: import z3
+        except Exception:
+            print("  bounded IL executor needs z3-solver (python -m pip install z3-solver)"); return None
+        name="arg0"; n=self._constraint_known_len(constraints,name) or max_len
+        n=max(0,min(max_len,n))
+        length=z3.Int("len_%s"%name); chars=[z3.BitVec("%s_%02d"%(name,i),16) for i in range(max_len)]
+        sol=z3.Solver(); sol.add(length>=0,length<=max_len)
+        for ch in chars: sol.add(z3.UGE(ch,0x20), z3.ULE(ch,0x7e))
+        def str_name(v): return v.get("name","arg0") if v and v.get("k")=="symstr" else "arg0"
+        def concrete_str(v): return v.get("v") if v and v.get("k")=="str" else None
+        def int_expr(v):
+            if v is None: return z3.IntVal(0)
+            if v.get("k")=="int": return z3.IntVal(int(v["v"]))
+            if v.get("k")=="strlen": return length
+            return None
+        def bv_expr(v):
+            if v is None: return z3.BitVecVal(0,16)
+            if v.get("k")=="int": return z3.BitVecVal(int(v["v"]) & 0xffff,16)
+            if v.get("k")=="char":
+                idx=v.get("i")
+                if isinstance(idx,dict) and idx.get("k")=="int": return chars[int(idx["v"])]
+                return chars[0]
+            if v.get("k")=="xor": return bv_expr(v["a"]) ^ bv_expr(v["b"])
+            if v.get("k") in ("add","sub","mul","and","or"):
+                a,b=bv_expr(v["a"]),bv_expr(v["b"])
+                return {"add":a+b,"sub":a-b,"mul":a*b,"and":a&b,"or":a|b}[v["k"]]
+            return None
+        def add_str_eq(sym,concrete,neg=False):
+            if concrete is None: return
+            if not neg: sol.add(length==len(concrete))
+            eqs=[]
+            for i,ch in enumerate(concrete[:max_len]): eqs.append(chars[i]==ord(ch))
+            sol.add(z3.Not(z3.And(*eqs)) if neg and eqs else z3.And(*eqs))
+        for c in constraints:
+            op=c[0]
+            if op=="len_eq": sol.add(length==int(c[2]))
+            elif op=="len_ne": sol.add(length!=int(c[2]))
+            elif op=="prefix":
+                pref=concrete_str(c[2]) or ""; sol.add(length>=len(pref))
+                for i,ch in enumerate(pref[:max_len]): sol.add(chars[i]==ord(ch))
+            elif op=="suffix":
+                suf=concrete_str(c[2]) or ""; known=self._constraint_known_len(constraints,name)
+                if known is not None and known>=len(suf):
+                    for i,ch in enumerate(suf): sol.add(chars[known-len(suf)+i]==ord(ch))
+            elif op=="str_eq":
+                a,b=c[1],c[2]
+                add_str_eq(a,concrete_str(b),False) if concrete_str(b) is not None else add_str_eq(b,concrete_str(a),False)
+            elif op=="str_ne":
+                a,b=c[1],c[2]
+                add_str_eq(a,concrete_str(b),True) if concrete_str(b) is not None else add_str_eq(b,concrete_str(a),True)
+            elif op in ("expr_eq","expr_ne"):
+                a,b=c[1],c[2]
+                ia,ib=int_expr(a),int_expr(b)
+                if ia is not None and ib is not None:
+                    sol.add(ia==ib if op=="expr_eq" else ia!=ib)
+                else:
+                    ba,bb=bv_expr(a),bv_expr(b)
+                    if ba is not None and bb is not None: sol.add(ba==bb if op=="expr_eq" else ba!=bb)
+        if sol.check()!=z3.sat: return None
+        model=sol.model(); ln=model.eval(length,model_completion=True).as_long(); ln=max(0,min(max_len,ln))
+        out=[]
+        for i in range(ln): out.append(chr(model.eval(chars[i],model_completion=True).as_long() & 0xff))
+        return "".join(out)
+
+    def _run_bounded_symbolic_solver(self,methods):
+        hr(".NET IL BOUNDED SYMBOLIC EXECUTOR")
+        found=[]
+        for m in methods[:24]:
+            sols=self._execute_symbolic_method(m)
+            for sol in sols:
+                if sol not in [x[1] for x in found]:
+                    found.append((m["name"],sol))
+                    print("  solved candidate: %r   method=%s" % (sol,m["name"]))
+        if not found: print("  no satisfiable return-true path found in selected bounded methods")
+        return found
+
     def solve(self):
         ok=self.report()
         hr(".NET IL SOLVE (bounded managed-string candidate extraction)")
@@ -493,6 +726,7 @@ class DotNetILFrontend:
             return False
         selected=self._matching_methods()
         self._constraint_shapes(selected)
+        self._run_bounded_symbolic_solver(selected)
         candidates=[]
         for m in selected:
             calls="\n".join(m["calls"])
@@ -526,6 +760,139 @@ class DotNetILFrontend:
         print("  status: candidates are static IL-derived and not runtime-verified")
         return True
 
+    def _ret_const_before(self, ins, idx):
+        j=idx-1
+        while j>=0 and ins[j]["op"]=="nop": j-=1
+        if j<0: return None
+        op=ins[j]["op"]
+        if op in ("ldc.i4.0","ldc.i4.1"): return op.endswith("1")
+        return None
+
+    def _reachable_method_slice_score(self, m, start_idx, max_steps=240):
+        """Score a caller side by reachable win/lose strings and approximate size."""
+        ins=m["ins"]; off_to_idx={x["off"]:i for i,x in enumerate(ins)}
+        seen=set(); stack=[start_idx]; strings=[]; count=0; rets=[]
+        while stack and count<max_steps:
+            i=stack.pop()
+            if i in seen or i<0 or i>=len(ins): continue
+            seen.add(i); count+=1
+            x=ins[i]
+            if x["op"]=="ldstr" and x.get("text"): strings.append(x["text"])
+            if x["op"]=="ret":
+                rv=self._ret_const_before(ins,i)
+                if rv is not None: rets.append(rv)
+                continue
+            op=x["op"]; nxt=i+1
+            if op in ("br.s","br"):
+                stack.append(off_to_idx.get(x.get("target"),nxt)); continue
+            if op.startswith(("brtrue","brfalse","beq","bne.un","bge","bgt","ble","blt")):
+                stack.append(nxt); stack.append(off_to_idx.get(x.get("target"),nxt)); continue
+            stack.append(nxt)
+        wins,loses,_=self._classify_strings(strings)
+        score=10*len(wins)-10*len(loses)+count/100.0
+        return {"score":score,"wins":wins,"loses":loses,"count":count,"rets":rets}
+
+    def _method_return_value_scores(self, m):
+        """Infer a desirable bool return from the selected method's own exits."""
+        scores={True:0.0, False:0.0}; reasons=[]; ins=m["ins"]
+        for i,x in enumerate(ins):
+            if x["op"]!="ret": continue
+            rv=self._ret_const_before(ins,i)
+            if rv is None: continue
+            # Look back within the local basic-block-ish window for outcome strings.
+            strings=[]; j=i-1; window=0
+            while j>=0 and window<18:
+                if ins[j]["op"].startswith(("br","beq","bne","bge","bgt","ble","blt")) and window>0: break
+                if ins[j]["op"]=="ldstr" and ins[j].get("text"): strings.append(ins[j]["text"])
+                j-=1; window+=1
+            wins,loses,_=self._classify_strings(strings)
+            delta=1.0 + 12.0*len(wins) - 12.0*len(loses)
+            scores[rv]+=delta
+            if wins or loses:
+                reasons.append("%s return at IL_%04x near win=%s lose=%s -> %+g" %
+                               (rv, x["off"], [w for w in wins[:2]], [l for l in loses[:2]], delta))
+            else:
+                reasons.append("%s return at IL_%04x -> %+g" % (rv, x["off"], delta))
+        return scores,reasons
+
+    def _caller_return_value_scores(self, target_name):
+        """Infer which bool return unlocks callers by inspecting call; brtrue/brfalse."""
+        scores={True:0.0, False:0.0}; reasons=[]
+        t=target_name.lower()
+        for m in self.methods:
+            ins=m["ins"]; off_to_idx={x["off"]:i for i,x in enumerate(ins)}
+            for i,x in enumerate(ins[:-1]):
+                if x["op"] not in ("call","callvirt") or not x.get("text"): continue
+                cname=x["text"].split("::")[-1].lower()
+                if cname!=t: continue
+                # direct bool use: call; brtrue/brfalse next instruction
+                j=i+1
+                while j<len(ins) and ins[j]["op"]=="nop": j+=1
+                if j>=len(ins): continue
+                br=ins[j]
+                if not (br["op"].startswith("brtrue") or br["op"].startswith("brfalse")): continue
+                target_idx=off_to_idx.get(br.get("target"), j+1)
+                fall_idx=j+1
+                target_score=self._reachable_method_slice_score(m,target_idx)
+                fall_score=self._reachable_method_slice_score(m,fall_idx)
+                if br["op"].startswith("brtrue"):
+                    true_side=false_side=target_score
+                    false_side=fall_score
+                else:
+                    false_side=target_score
+                    true_side=fall_score
+                # Prefer win/lose classification. Size is only a tiny tiebreaker.
+                scores[True]+=true_side["score"]; scores[False]+=false_side["score"]
+                reasons.append("caller %s IL_%04x %s: true_score=%.2f false_score=%.2f" %
+                               (m["name"], br["off"], br["op"], true_side["score"], false_side["score"]))
+        return scores,reasons
+
+    def _infer_bool_patch_return(self, m):
+        own,own_reasons=self._method_return_value_scores(m)
+        caller,caller_reasons=self._caller_return_value_scores(m["name"])
+        scores={True:own[True]+caller[True], False:own[False]+caller[False]}
+        reasons=own_reasons+caller_reasons
+        print("  IL return inference for %s:" % m["name"])
+        print("    true score : %.2f" % scores[True])
+        print("    false score: %.2f" % scores[False])
+        for r in reasons[:10]: print("    - "+r)
+        if scores[True]==scores[False]: return None
+        return True if scores[True]>scores[False] else False
+
+    def _write_return_patch(self,methods,out_arg=None):
+        if not self.il_write_patch:
+            print("  IL patch write: disabled; add --il-write-patch for method-body replacement")
+            return False
+        if len(methods)!=1:
+            print("  IL patch write: refusing because --il-method matched %d methods; use an exact filter" % len(methods))
+            return False
+        m=methods[0]; body=m.get("body") or {}
+        if body.get("more_sects"):
+            print("  IL patch write: refusing method with extra EH/section metadata")
+            return False
+        code_size=int(body.get("code_size") or 0); code_off=int(body.get("code_off") or 0)
+        ret_choice=self.il_patch_return
+        if ret_choice=="auto":
+            inferred=self._infer_bool_patch_return(m)
+            if inferred is None:
+                print("  IL patch write: could not infer the desired bool return; rerun with --il-patch-return true|false")
+                return False
+            ret_choice="true" if inferred else "false"
+        patch = bytes([0x17 if ret_choice=="true" else 0x16, 0x2a])  # ldc.i4.1/0 ; ret
+        if code_size < len(patch):
+            print("  IL patch write: method body too small")
+            return False
+        data=bytearray(_read_file_prefix(self.primary, 1<<30))
+        data[code_off:code_off+len(patch)] = patch
+        for i in range(code_off+len(patch), code_off+code_size): data[i]=0x00  # nop padding
+        out=out_arg or (self.primary+".patched")
+        parent=os.path.dirname(out)
+        if parent: os.makedirs(parent, exist_ok=True)
+        with open(out,"wb") as f: f.write(data)
+        print("  IL patch write: method %s -> return %s" % (m["name"], ret_choice))
+        print("  wrote %s (original untouched)" % out)
+        return True
+
     def patch(self, out_arg=None):
         old_plan=self.il_plan_patch
         self.il_plan_patch=False  # avoid printing the same plan twice in --mode patch
@@ -535,15 +902,20 @@ class DotNetILFrontend:
             hr(".NET IL PATCH PLAN")
             print("  no IL metadata decoder available; cannot plan IL branch rewrites")
             return False
-        # Non-destructive by design: produce an IL rewrite plan, not a modified
-        # third-party assembly.  Native patching remains in the angr backend.
-        return self._patch_plan(self._matching_methods())
+        methods=self._matching_methods()
+        planned=self._patch_plan(methods)
+        if self.il_write_patch:
+            return self._write_return_patch(methods,out_arg=out_arg)
+        return planned
 
 def select_runtime_frontend(kind, binary, rt, explicit_assembly=None,
-                            method_filter=None, il_dump=False, il_plan_patch=False):
+                            method_filter=None, il_dump=False, il_plan_patch=False,
+                            il_write_patch=False, il_patch_return="auto"):
     if kind in ("dotnet-apphost","dotnet-managed"):
         return DotNetILFrontend(binary, rt, explicit_assembly=explicit_assembly,
                                 method_filter=method_filter, il_dump=il_dump,
-                                il_plan_patch=il_plan_patch)
+                                il_plan_patch=il_plan_patch,
+                                il_write_patch=il_write_patch,
+                                il_patch_return=il_patch_return)
     return None
 
