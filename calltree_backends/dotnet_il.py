@@ -9,6 +9,7 @@ is opt-in
 import os
 import sys
 
+from calltree_backends.frontend import AnalyzerFrontend, AnalyzerOptions
 from calltree_backends.outcomes import WIN_WORDS, LOSE_WORDS, classify_strings
 
 def hr(t): print("\n"+"="*66+"\n  "+t+"\n"+"="*66)
@@ -271,7 +272,7 @@ def _method_il_bytes(pe, mrow):
     info=_method_body_info(pe,mrow)
     return info.get("code") if info else None
 
-class DotNetILFrontend:
+class DotNetILFrontend(AnalyzerFrontend):
     """Runtime-specific frontend for managed .NET assemblies.
 
     This is intentionally a frontend boundary, not a CoreCLR-native hack.  It
@@ -284,13 +285,22 @@ class DotNetILFrontend:
     COMPARE_CALLS=("String::Equals","String::op_Equality","String::Compare","SequenceEqual","StartsWith","EndsWith","Contains")
     SINK_CALLS=("Console::WriteLine","MessageBox::Show","Environment::Exit")
 
-    def __init__(self, binary, rt=None, explicit_assembly=None, method_filter=None,
-                 il_dump=False, il_plan_patch=False, il_write_patch=False,
-                 il_patch_return="auto"):
-        self.binary=binary; self.rt=rt or {}; self.explicit_assembly=explicit_assembly
-        self.method_filter=method_filter; self.il_dump=il_dump; self.il_plan_patch=il_plan_patch
-        self.il_write_patch=il_write_patch; self.il_patch_return=il_patch_return
-        self.assemblies=_dotnet_payload_candidates(binary,self.rt, explicit=explicit_assembly)
+    def __init__(self, binary, rt=None, options=None, explicit_assembly=None,
+                 method_filter=None, il_dump=False, il_plan_patch=False,
+                 il_write_patch=False, il_patch_return="auto"):
+        if options is None:
+            options=AnalyzerOptions(method_filter=method_filter,
+                                    patch_return=il_patch_return,
+                                    write_patch=il_write_patch,
+                                    il_assembly=explicit_assembly,
+                                    il_dump=il_dump,
+                                    il_plan_patch=il_plan_patch)
+        self.options=options
+        self.binary=binary; self.rt=rt or {}; self.explicit_assembly=options.il_assembly
+        self.method_filter=options.method_filter; self.il_dump=options.il_dump
+        self.il_plan_patch=options.il_plan_patch; self.write_patch=options.write_patch
+        self.il_patch_return=options.il_return
+        self.assemblies=_dotnet_payload_candidates(binary,self.rt, explicit=self.explicit_assembly)
         self.primary=self.assemblies[0] if self.assemblies else None
         self.pe=None; self.dnfile_error=None; self.raw=[]; self.methods=[]
 
@@ -390,7 +400,7 @@ class DotNetILFrontend:
                     print("    ... %d more instruction(s)" % (len(m["ins"])-shown)); break
             print()
         if len(methods)>max_methods:
-            print("  ... %d more matching method(s); narrow with --il-method" % (len(methods)-max_methods))
+            print("  ... %d more matching method(s); narrow with --method" % (len(methods)-max_methods))
 
     def _constraint_shapes(self, methods):
         """Report source/compare/string shapes without claiming a solved input.
@@ -418,7 +428,7 @@ class DotNetILFrontend:
             if wins: print("    win-ish : %s" % ", ".join(repr(x) for x in wins[:3]))
             if loses: print("    lose-ish: %s" % ", ".join(repr(x) for x in loses[:3]))
         if len(rows)>12:
-            print("  ... %d more method(s); narrow with --il-method" % (len(rows)-12))
+            print("  ... %d more method(s); narrow with --method" % (len(rows)-12))
 
     def _patch_plan(self, methods):
         """Dry-run IL branch rewrite plan. Does not modify assemblies."""
@@ -860,11 +870,11 @@ class DotNetILFrontend:
         return True if scores[True]>scores[False] else False
 
     def _write_return_patch(self,methods,out_arg=None):
-        if not self.il_write_patch:
-            print("  IL patch write: disabled; add --il-write-patch for method-body replacement")
+        if not self.write_patch:
+            print("  IL patch write: disabled; add --write-patch for method-body replacement")
             return False
         if len(methods)!=1:
-            print("  IL patch write: refusing because --il-method matched %d methods; use an exact filter" % len(methods))
+            print("  IL patch write: refusing because --method matched %d methods; use an exact filter" % len(methods))
             return False
         m=methods[0]; body=m.get("body") or {}
         if body.get("more_sects"):
@@ -875,7 +885,7 @@ class DotNetILFrontend:
         if ret_choice=="auto":
             inferred=self._infer_bool_patch_return(m)
             if inferred is None:
-                print("  IL patch write: could not infer the desired bool return; rerun with --il-patch-return true|false")
+                print("  IL patch write: could not infer the desired bool return; rerun with --patch-return true|false")
                 return False
             ret_choice="true" if inferred else "false"
         patch = bytes([0x17 if ret_choice=="true" else 0x16, 0x2a])  # ldc.i4.1/0 ; ret
@@ -904,18 +914,21 @@ class DotNetILFrontend:
             return False
         methods=self._matching_methods()
         planned=self._patch_plan(methods)
-        if self.il_write_patch:
+        if self.write_patch:
             return self._write_return_patch(methods,out_arg=out_arg)
         return planned
 
-def select_runtime_frontend(kind, binary, rt, explicit_assembly=None,
+def select_runtime_frontend(kind, binary, rt, options=None, explicit_assembly=None,
                             method_filter=None, il_dump=False, il_plan_patch=False,
                             il_write_patch=False, il_patch_return="auto"):
+    if options is None:
+        options=AnalyzerOptions(method_filter=method_filter,
+                                patch_return=il_patch_return,
+                                write_patch=il_write_patch,
+                                il_assembly=explicit_assembly,
+                                il_dump=il_dump,
+                                il_plan_patch=il_plan_patch)
     if kind in ("dotnet-apphost","dotnet-managed"):
-        return DotNetILFrontend(binary, rt, explicit_assembly=explicit_assembly,
-                                method_filter=method_filter, il_dump=il_dump,
-                                il_plan_patch=il_plan_patch,
-                                il_write_patch=il_write_patch,
-                                il_patch_return=il_patch_return)
+        return DotNetILFrontend(binary, rt, options=options)
     return None
 

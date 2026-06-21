@@ -5,9 +5,10 @@ This directory starts the split from the original monolithic `calltree_triage_ne
 Current modules:
 
 - `dotnet_il.py` — managed .NET/CLI metadata and IL frontend. It handles assembly discovery, raw/metadata string extraction, CIL decoding, method filtering, IL dumps, constraint-shape reporting, a bounded symbolic IL executor, dry-run patch plans, bool return-value inference from IL win/lose paths and caller branch use, and method-body replacement for owned/generated samples.
+- `frontend.py` - shared analyzer option normalization and frontend contract.
 - `outcomes.py` — shared win/lose string heuristics used by native and IL frontends as semantic anchors.
 
-The native angr backend now lives in `native_angr.py`; the old upload wrapper has been removed; use `main.py`.
+The native angr backend now lives in `native_angr.py`; both shipped backends consume `AnalyzerOptions` and expose `report()`, `solve()`, and `patch()`. The old upload wrapper has been removed; use `main.py`.
 
 Shared interface and flag model:
 

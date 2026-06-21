@@ -45,6 +45,8 @@ for _p in (os.getcwd(), os.path.dirname(os.path.dirname(os.path.abspath(__file__
     if os.path.isdir(os.path.join(_p, "calltree_backends")) and _p not in sys.path:
         sys.path.insert(0, _p)
 
+from calltree_backends.frontend import AnalyzerFrontend, AnalyzerOptions
+
 def verify_real(binary, stdin_bytes, files, envs):
     """Drive recovered inputs into the REAL binary; True iff it prints success.
     Linux-host only (executes ./binary directly)."""
@@ -905,15 +907,28 @@ def patch_gate(proj, gate, src=None, out_arg=None, dry_run=False):
 # ---------------------------------------------------------------------------
 # Native angr frontend wrapper (used by the refactored top-level CLI)
 # ---------------------------------------------------------------------------
-class NativeAngrFrontend:
+class NativeAngrFrontend(AnalyzerFrontend):
     """Native ELF/PE backend backed by angr.
 
     This class wraps the original architecture-agnostic native pipeline so the
     top-level CLI can route native targets to angr and runtime/managed targets
     to dedicated frontends.
     """
-    def __init__(self, binary):
+    def __init__(self, binary, options=None, method_filter=None, return_patch=False,
+                 write_patch=False, patch_return="auto", force_low_confidence=False):
+        if options is None:
+            options=AnalyzerOptions(method_filter=method_filter,
+                                    return_patch=return_patch,
+                                    write_patch=write_patch,
+                                    patch_return=patch_return,
+                                    force_low_confidence=force_low_confidence)
+        self.options=options
         self.binary=binary
+        self.method_filter=options.method_filter
+        self.return_patch=options.return_patch
+        self.write_patch=options.write_patch
+        self.patch_return=options.native_return
+        self.force_low_confidence=options.force_low_confidence
         self.proj,self.cfg=load_calltree(binary)
         self.os_,self.files,self.envs,self.regs=detect_sources(self.proj,self.cfg)
         self.gate=None
@@ -989,10 +1004,16 @@ class NativeAngrFrontend:
             if body is None or (f.size or 0)>(body.size or 0): body=f
         return {body.addr} if body else win
 
-    def advise(self):
+    def report(self):
         self._print_gate_report()
+        return True
 
-    def solve(self, force_low_confidence=False):
+    def advise(self):
+        return self.report()
+
+    def solve(self, force_low_confidence=None):
+        if force_low_confidence is None:
+            force_low_confidence=self.force_low_confidence
         gate,low_conf,no_gate=self._print_gate_report()
         if no_gate: print(); return False
         if low_conf and not force_low_confidence:
@@ -1164,7 +1185,7 @@ class NativeAngrFrontend:
         if ret_value=="auto":
             rv=self._infer_native_return_value(f)
             if rv is None:
-                print("  native return patch: could not infer return value; rerun with --native-patch-return zero|one")
+                print("  native return patch: could not infer return value; rerun with --patch-return zero|one")
                 return False
         else:
             rv=1 if ret_value in ("one","nonzero","true") else 0
@@ -1195,20 +1216,23 @@ class NativeAngrFrontend:
         print("  wrote %s (original untouched)" % out)
         return True
 
-    def patch_return_function(self, function_filter, out_arg=None, ret_value="auto", write_patch=False):
+    def patch_return_function(self, function_filter=None, out_arg=None, ret_value=None, write_patch=None):
+        if function_filter is None: function_filter=self.method_filter
+        if ret_value is None: ret_value=self.patch_return
+        if write_patch is None: write_patch=self.write_patch
         hr("PATCH (native function return override%s)" % ("" if write_patch else " dry-run"))
         matches=self._find_native_functions(function_filter)
         if not matches:
-            print("  no matching owned function for --native-function %r" % function_filter); return False
+            print("  no matching owned function for --method %r" % function_filter); return False
         if len(matches)!=1:
-            print("  refusing: --native-function matched %d functions; use an exact name or address" % len(matches))
+            print("  refusing: --method matched %d functions; use an exact name or address" % len(matches))
             for f in matches[:20]: print("    - %s @ %#x" % (f.name,f.addr))
             return False
         f=matches[0]
         # Always infer/report first. Only write when explicitly enabled
         inferred = self._infer_native_return_value(f) if ret_value=="auto" else (1 if ret_value=="one" else 0)
         if inferred is None:
-            print("  native return patch: could not infer return value; rerun with --native-patch-return zero|one")
+            print("  native return patch: could not infer return value; rerun with --patch-return zero|one")
             return False
         if not write_patch:
             print("  dry-run: would patch %s @ %#x to return %d" % (f.name,f.addr,inferred))
@@ -1216,7 +1240,13 @@ class NativeAngrFrontend:
             return True
         return self._write_native_return_stub(f, out_arg=out_arg, ret_value=("one" if inferred else "zero"))
 
-    def patch(self, out_arg=None, force_low_confidence=False, write_patch=False):
+    def patch(self, out_arg=None, force_low_confidence=None, write_patch=None):
+        if self.return_patch:
+            return self.patch_return_function(out_arg=out_arg)
+        if force_low_confidence is None:
+            force_low_confidence=self.force_low_confidence
+        if write_patch is None:
+            write_patch=self.write_patch
         dry_run=not write_patch
         if not write_patch:
             print("  native patch write disabled; printing dry-run patch plan (add --write-patch to write)")

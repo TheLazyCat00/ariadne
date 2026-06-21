@@ -24,6 +24,7 @@ main.py                             # main CLI entrypoint
 calltree_backends/
   native_angr.py                    # native angr backend
   dotnet_il.py                      # .NET IL frontend
+  frontend.py                       # shared frontend options/interface
   outcomes.py                       # shared win/lose string heuristics
 ```
 
@@ -64,7 +65,7 @@ python main.py ./App.exe \
   --frontend dotnet-il \
   --il-assembly ./App.dll \
   --mode solve \
-  --il-method '(License|Trial|Activation|Product|Key|Check)'
+  --method '(License|Trial|Activation|Product|Key|Check)'
 ```
 
 Dump IL and print a non-destructive patch plan:
@@ -87,7 +88,7 @@ Shared patch flags:
 --write-patch                actually write a patched copy
 ```
 
-Without `--write-patch`, patch-capable backends print dry-run plans where possible.
+Backend-specific historical aliases still parse for existing scripts, but new usage should prefer the shared flags above. Without `--write-patch`, patch-capable backends print dry-run plans where possible.
 
 ## License
 
