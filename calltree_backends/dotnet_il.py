@@ -3,8 +3,8 @@
 
 This backend is intentionally managed-code-aware. It analyzes CLI metadata and
 CIL directly instead of asking angr to execute CoreCLR bootstrap code.
-Patch mode emits dry-run plans by default; write-capable method-body replacement
-is opt-in
+Patch mode rewrites failure-only conditional branches in place (stack-balanced
+`pop`+`nop`) toward the win side; --mode plan-patch shows a non-destructive preview.
 """
 import os
 import sys
@@ -152,39 +152,79 @@ def _dotnet_user_string(pe, token):
     except Exception:
         return None
 
-# Minimal CIL decoder sufficient for source/sink/candidate discovery.  It is
-# deliberately conservative; future IL-family frontends can implement a richer
-# CFG/symbolic executor behind the same DotNetILFrontend interface.
+# Full ECMA-335 CIL opcode map (single-byte plus the 0xFE two-byte family).
+# Completeness matters for more than pretty disassembly: every opcode must
+# declare its operand size so the linear decoder stays in sync.  A missing
+# entry would fall back to a zero-length operand and silently misread every
+# instruction after it in the method (the operand bytes get decoded as
+# opcodes).  Operand kinds: none / u1 / u2 / i1 / i4 / i8 / r4 / r8 /
+# token (4-byte metadata or string token) / br1 / br4 (branch displacements) /
+# switch (uint32 count followed by that many int32 targets).
 _IL_ONE={
-  0x00:("nop","none"), 0x02:("ldarg.0","none"),0x03:("ldarg.1","none"),0x04:("ldarg.2","none"),0x05:("ldarg.3","none"),
+  0x00:("nop","none"),0x01:("break","none"),
+  0x02:("ldarg.0","none"),0x03:("ldarg.1","none"),0x04:("ldarg.2","none"),0x05:("ldarg.3","none"),
   0x06:("ldloc.0","none"),0x07:("ldloc.1","none"),0x08:("ldloc.2","none"),0x09:("ldloc.3","none"),
   0x0a:("stloc.0","none"),0x0b:("stloc.1","none"),0x0c:("stloc.2","none"),0x0d:("stloc.3","none"),
   0x0e:("ldarg.s","u1"),0x0f:("ldarga.s","u1"),0x10:("starg.s","u1"),0x11:("ldloc.s","u1"),0x12:("ldloca.s","u1"),0x13:("stloc.s","u1"),
   0x14:("ldnull","none"),0x15:("ldc.i4.m1","none"),0x16:("ldc.i4.0","none"),0x17:("ldc.i4.1","none"),0x18:("ldc.i4.2","none"),
   0x19:("ldc.i4.3","none"),0x1a:("ldc.i4.4","none"),0x1b:("ldc.i4.5","none"),0x1c:("ldc.i4.6","none"),0x1d:("ldc.i4.7","none"),
-  0x1e:("ldc.i4.8","none"),0x1f:("ldc.i4.s","i1"),0x20:("ldc.i4","i4"),0x25:("dup","none"),0x26:("pop","none"),
-  0x28:("call","token"),0x2a:("ret","none"),0x2b:("br.s","br1"),0x2c:("brfalse.s","br1"),0x2d:("brtrue.s","br1"),
+  0x1e:("ldc.i4.8","none"),0x1f:("ldc.i4.s","i1"),0x20:("ldc.i4","i4"),0x21:("ldc.i8","i8"),0x22:("ldc.r4","r4"),0x23:("ldc.r8","r8"),
+  0x25:("dup","none"),0x26:("pop","none"),0x27:("jmp","token"),0x28:("call","token"),0x29:("calli","token"),0x2a:("ret","none"),
+  0x2b:("br.s","br1"),0x2c:("brfalse.s","br1"),0x2d:("brtrue.s","br1"),
   0x2e:("beq.s","br1"),0x2f:("bge.s","br1"),0x30:("bgt.s","br1"),0x31:("ble.s","br1"),0x32:("blt.s","br1"),0x33:("bne.un.s","br1"),
+  0x34:("bge.un.s","br1"),0x35:("bgt.un.s","br1"),0x36:("ble.un.s","br1"),0x37:("blt.un.s","br1"),
   0x38:("br","br4"),0x39:("brfalse","br4"),0x3a:("brtrue","br4"),0x3b:("beq","br4"),0x3c:("bge","br4"),0x3d:("bgt","br4"),
-  0x3e:("ble","br4"),0x3f:("blt","br4"),0x40:("bne.un","br4"),0x45:("switch","switch"),0x58:("add","none"),0x59:("sub","none"),
-  0x5a:("mul","none"),0x5b:("div","none"),0x5f:("and","none"),0x60:("or","none"),0x61:("xor","none"),0x65:("neg","none"),
+  0x3e:("ble","br4"),0x3f:("blt","br4"),0x40:("bne.un","br4"),0x41:("bge.un","br4"),0x42:("bgt.un","br4"),0x43:("ble.un","br4"),
+  0x44:("blt.un","br4"),0x45:("switch","switch"),
+  0x46:("ldind.i1","none"),0x47:("ldind.u1","none"),0x48:("ldind.i2","none"),0x49:("ldind.u2","none"),0x4a:("ldind.i4","none"),
+  0x4b:("ldind.u4","none"),0x4c:("ldind.i8","none"),0x4d:("ldind.i","none"),0x4e:("ldind.r4","none"),0x4f:("ldind.r8","none"),
+  0x50:("ldind.ref","none"),0x51:("stind.ref","none"),0x52:("stind.i1","none"),0x53:("stind.i2","none"),0x54:("stind.i4","none"),
+  0x55:("stind.i8","none"),0x56:("stind.r4","none"),0x57:("stind.r8","none"),
+  0x58:("add","none"),0x59:("sub","none"),0x5a:("mul","none"),0x5b:("div","none"),0x5c:("div.un","none"),0x5d:("rem","none"),
+  0x5e:("rem.un","none"),0x5f:("and","none"),0x60:("or","none"),0x61:("xor","none"),0x62:("shl","none"),0x63:("shr","none"),
+  0x64:("shr.un","none"),0x65:("neg","none"),0x66:("not","none"),
+  0x67:("conv.i1","none"),0x68:("conv.i2","none"),0x69:("conv.i4","none"),0x6a:("conv.i8","none"),0x6b:("conv.r4","none"),
+  0x6c:("conv.r8","none"),0x6d:("conv.u4","none"),0x6e:("conv.u8","none"),
   0x6f:("callvirt","token"),0x70:("cpobj","token"),0x71:("ldobj","token"),0x72:("ldstr","token"),0x73:("newobj","token"),
-  0x74:("castclass","token"),0x75:("isinst","token"),0x7b:("ldfld","token"),0x7c:("ldflda","token"),0x7d:("stfld","token"),
-  0x7e:("ldsfld","token"),0x7f:("ldsflda","token"),0x80:("stsfld","token"),0x8c:("box","token"),0x8d:("newarr","token"),
-  0x8e:("ldlen","none"),0x8f:("ldelema","token"),0x90:("ldelem.i1","none"),0x91:("ldelem.u1","none"),0x92:("ldelem.i2","none"),
-  0x93:("ldelem.u2","none"),0x94:("ldelem.i4","none"),0x95:("ldelem.u4","none"),0x96:("ldelem.i8","none"),0x97:("ldelem.i","none"),
-  0x98:("ldelem.r4","none"),0x99:("ldelem.r8","none"),0x9a:("ldelem.ref","none"),0x9b:("stelem.i","none"),0x9c:("stelem.i1","none"),
-  0x9d:("stelem.i2","none"),0x9e:("stelem.i4","none"),0x9f:("stelem.i8","none"),0xa0:("stelem.r4","none"),0xa1:("stelem.r8","none"),
-  0xa2:("stelem.ref","none"),0xa3:("ldelem","token"),0xa4:("stelem","token"),0xa5:("unbox.any","token"),0xd0:("ldtoken","token"),
+  0x74:("castclass","token"),0x75:("isinst","token"),0x76:("conv.r.un","none"),0x79:("unbox","token"),0x7a:("throw","none"),
+  0x7b:("ldfld","token"),0x7c:("ldflda","token"),0x7d:("stfld","token"),0x7e:("ldsfld","token"),0x7f:("ldsflda","token"),
+  0x80:("stsfld","token"),0x81:("stobj","token"),
+  0x82:("conv.ovf.i1.un","none"),0x83:("conv.ovf.i2.un","none"),0x84:("conv.ovf.i4.un","none"),0x85:("conv.ovf.i8.un","none"),
+  0x86:("conv.ovf.u1.un","none"),0x87:("conv.ovf.u2.un","none"),0x88:("conv.ovf.u4.un","none"),0x89:("conv.ovf.u8.un","none"),
+  0x8a:("conv.ovf.i.un","none"),0x8b:("conv.ovf.u.un","none"),
+  0x8c:("box","token"),0x8d:("newarr","token"),0x8e:("ldlen","none"),0x8f:("ldelema","token"),
+  0x90:("ldelem.i1","none"),0x91:("ldelem.u1","none"),0x92:("ldelem.i2","none"),0x93:("ldelem.u2","none"),0x94:("ldelem.i4","none"),
+  0x95:("ldelem.u4","none"),0x96:("ldelem.i8","none"),0x97:("ldelem.i","none"),0x98:("ldelem.r4","none"),0x99:("ldelem.r8","none"),
+  0x9a:("ldelem.ref","none"),0x9b:("stelem.i","none"),0x9c:("stelem.i1","none"),0x9d:("stelem.i2","none"),0x9e:("stelem.i4","none"),
+  0x9f:("stelem.i8","none"),0xa0:("stelem.r4","none"),0xa1:("stelem.r8","none"),0xa2:("stelem.ref","none"),
+  0xa3:("ldelem","token"),0xa4:("stelem","token"),0xa5:("unbox.any","token"),
+  0xb3:("conv.ovf.i1","none"),0xb4:("conv.ovf.u1","none"),0xb5:("conv.ovf.i2","none"),0xb6:("conv.ovf.u2","none"),
+  0xb7:("conv.ovf.i4","none"),0xb8:("conv.ovf.u4","none"),0xb9:("conv.ovf.i8","none"),0xba:("conv.ovf.u8","none"),
+  0xc2:("refanyval","token"),0xc3:("ckfinite","none"),0xc6:("mkrefany","token"),0xd0:("ldtoken","token"),
+  0xd1:("conv.u2","none"),0xd2:("conv.u1","none"),0xd3:("conv.i","none"),0xd4:("conv.ovf.i","none"),0xd5:("conv.ovf.u","none"),
+  0xd6:("add.ovf","none"),0xd7:("add.ovf.un","none"),0xd8:("mul.ovf","none"),0xd9:("mul.ovf.un","none"),0xda:("sub.ovf","none"),
+  0xdb:("sub.ovf.un","none"),0xdc:("endfinally","none"),0xdd:("leave","br4"),0xde:("leave.s","br1"),0xdf:("stind.i","none"),
+  0xe0:("conv.u","none"),
 }
-_IL_TWO={0x01:("ceq","none"),0x02:("cgt","none"),0x03:("cgt.un","none"),0x04:("clt","none"),0x05:("clt.un","none")}
+_IL_TWO={
+  0x00:("arglist","none"),0x01:("ceq","none"),0x02:("cgt","none"),0x03:("cgt.un","none"),0x04:("clt","none"),0x05:("clt.un","none"),
+  0x06:("ldftn","token"),0x07:("ldvirtftn","token"),
+  0x09:("ldarg","u2"),0x0a:("ldarga","u2"),0x0b:("starg","u2"),0x0c:("ldloc","u2"),0x0d:("ldloca","u2"),0x0e:("stloc","u2"),
+  0x0f:("localloc","none"),0x11:("endfilter","none"),0x12:("unaligned.","u1"),0x13:("volatile.","none"),0x14:("tail.","none"),
+  0x15:("initobj","token"),0x16:("constrained.","token"),0x17:("cpblk","none"),0x18:("initblk","none"),0x19:("no.","u1"),
+  0x1a:("rethrow","none"),0x1c:("sizeof","token"),0x1d:("refanytype","none"),0x1e:("readonly.","none"),
+}
 
 def _cil_operand(code, i, kind):
     import struct
     if kind=="none": return None,i
     if kind=="u1": return code[i], i+1
+    if kind=="u2": return struct.unpack_from("<H",code,i)[0], i+2
     if kind=="i1": return struct.unpack_from("b",code,i)[0], i+1
     if kind=="i4": return struct.unpack_from("<i",code,i)[0], i+4
+    if kind=="i8": return struct.unpack_from("<q",code,i)[0], i+8
+    if kind=="r4": return struct.unpack_from("<f",code,i)[0], i+4
+    if kind=="r8": return struct.unpack_from("<d",code,i)[0], i+8
     if kind=="token": return struct.unpack_from("<I",code,i)[0], i+4
     if kind=="br1": return struct.unpack_from("b",code,i)[0], i+1
     if kind=="br4": return struct.unpack_from("<i",code,i)[0], i+4
@@ -200,6 +240,8 @@ def _decode_cil(code, pe=None):
         off=i; b=code[i]; i+=1
         if b==0xfe and i<len(code):
             b2=code[i]; i+=1
+            # An unrecognized 0xFE opcode is an undefined slot; we cannot know
+            # its operand length, so decoding cannot safely continue past it.
             name,kind=_IL_TWO.get(b2,("unknown.fe%02x"%b2,"none"))
         else:
             name,kind=_IL_ONE.get(b,("unknown.%02x"%b,"none"))
@@ -267,13 +309,14 @@ class DotNetILFrontend(AnalyzerFrontend):
                   "File::ReadAllBytes","Registry::GetValue","RegistryKey::GetValue")
     COMPARE_CALLS=("String::Equals","String::op_Equality","String::Compare","SequenceEqual","StartsWith","EndsWith","Contains")
     SINK_CALLS=("Console::WriteLine","MessageBox::Show","Environment::Exit")
+    # Conditional branch opcodes (short and long forms share these prefixes).
+    COND_BRANCH_PREFIX=("brtrue","brfalse","beq","bne.un","bge","bgt","ble","blt")
+    FLIP_MARGIN_MIN=5.0     # min slice-score separation to call a branch failure-only
 
     def __init__(self, binary, rt=None, options=None):
         self.options=options or AnalyzerOptions()
         self.binary=binary; self.rt=rt or {}; self.explicit_assembly=self.options.il_assembly
         self.method_filter=self.options.method_filter; self.il_dump=self.options.il_dump
-        self.il_plan_patch=self.options.il_plan_patch; self.write_patch=self.options.write_patch
-        self.il_patch_return=self.options.il_return
         self.assemblies=_dotnet_payload_candidates(binary,self.rt, explicit=self.explicit_assembly)
         self.primary=self.assemblies[0] if self.assemblies else None
         self.pe=None; self.dnfile_error=None; self.raw=[]; self.methods=[]
@@ -405,33 +448,24 @@ class DotNetILFrontend(AnalyzerFrontend):
             print("  ... %d more method(s); narrow with --method" % (len(rows)-12))
 
     def _patch_plan(self, methods):
-        """Dry-run IL branch rewrite plan. Does not modify assemblies."""
-        hr(".NET IL PATCH PLAN (dry-run; no bytes written)")
-        any_plan=False
-        cond_prefix=("brfalse","brtrue","beq","bne.un","bge","bgt","ble","blt")
-        for m in methods:
-            wins,loses,other=self._classify_strings(m["strings"])
-            calls="\n".join(m["calls"])
-            interesting = wins or loses or any(x in calls for x in self.COMPARE_CALLS) or any(x in calls for x in self.SOURCE_CALLS)
-            if not interesting: continue
-            branches=[ins for ins in m["ins"] if any(ins["op"].startswith(p) for p in cond_prefix)]
-            if not branches: continue
-            any_plan=True
-            print("  method: %s" % m["name"])
-            if wins: print("    win-ish strings : %s" % ", ".join(repr(x) for x in wins[:3]))
-            if loses: print("    lose-ish strings: %s" % ", ".join(repr(x) for x in loses[:3]))
-            for br in branches[:12]:
-                fall=br.get("end")
-                tgt=br.get("target")
-                print("    branch %s -> target %s, fallthrough IL_%04x" %
-                      (self._format_il(br), ("IL_%04x"%tgt if isinstance(tgt,int) else repr(tgt)), fall))
-                print("      dry-run options: force fallthrough (NOP branch) OR force target (replace with unconditional br)")
-            if len(branches)>12:
-                print("    ... %d more conditional branch(es)" % (len(branches)-12))
-        if not any_plan:
-            print("  no IL conditional branches found near source/compare/outcome logic")
-        print("  status: plan only. IL assembly rewriting is not performed by this tool.")
-        return any_plan
+        """Non-destructive branch-flip preview (driven by --mode plan-patch):
+        exactly the branches a `--mode patch` run would rewrite, plus the ones it
+        must skip. No bytes are written."""
+        hr(".NET IL BRANCH-FLIP PLAN (preview; no bytes written)")
+        flips,skipped=self._branch_flip_targets(methods)
+        for m,br,why in skipped:
+            print("  skip %s @ IL_%04x in %s: %s" % (br["op"],br["off"],m["name"],why))
+        if not flips:
+            print("  no in-place-flippable failure branch found near outcome logic")
+            print("  status: preview only; run --mode patch to write the flips it finds.")
+            return False
+        for m,br,n_pops,tscore,fscore in flips:
+            print("  method %s: flip %s @ IL_%04x -> pop x%d + nop (force win-side fallthrough)"
+                  % (m["name"], br["op"], br["off"], n_pops))
+            if fscore["wins"]: print("    win side : %s" % ", ".join(repr(x) for x in fscore["wins"][:2]))
+            if tscore["loses"]: print("    lose side: %s" % ", ".join(repr(x) for x in tscore["loses"][:2]))
+        print("  status: preview only; run --mode patch to apply these flips.")
+        return True
 
     def report(self):
         hr(".NET IL FRONTEND (managed payload analysis)")
@@ -469,14 +503,18 @@ class DotNetILFrontend(AnalyzerFrontend):
             selected=self._matching_methods()
             if self.method_filter:
                 print("  method filter    : %r -> %d method(s)" % (self.method_filter, len(selected)))
-            if self.method_filter or self.il_dump or self.il_plan_patch:
+            if self.method_filter or self.il_dump:
                 self._constraint_shapes(selected)
             if self.il_dump:
                 self._dump_methods(selected)
-            if self.il_plan_patch:
-                self._patch_plan(selected)
         print("  note             : this frontend handles managed IL; native angr remains the frontend for non-IL targets")
         return ok
+
+    def plan_patch(self):
+        ok=self.report()
+        if not ok:
+            return False
+        return self._patch_plan(self._matching_methods())
 
     def _v_int(self,n): return {"k":"int","v":int(n)}
     def _v_str(self,s): return {"k":"str","v":s}
@@ -776,121 +814,89 @@ class DotNetILFrontend(AnalyzerFrontend):
         score=10*len(wins)-10*len(loses)+count/100.0
         return {"score":score,"wins":wins,"loses":loses,"count":count,"rets":rets}
 
-    def _method_return_value_scores(self, m):
-        """Infer a desirable bool return from the selected method's own exits."""
-        scores={True:0.0, False:0.0}; reasons=[]; ins=m["ins"]
-        for i,x in enumerate(ins):
-            if x["op"]!="ret": continue
-            rv=self._ret_const_before(ins,i)
-            if rv is None: continue
-            # Look back within the local basic-block-ish window for outcome strings.
-            strings=[]; j=i-1; window=0
-            while j>=0 and window<18:
-                if ins[j]["op"].startswith(("br","beq","bne","bge","bgt","ble","blt")) and window>0: break
-                if ins[j]["op"]=="ldstr" and ins[j].get("text"): strings.append(ins[j]["text"])
-                j-=1; window+=1
-            wins,loses,_=self._classify_strings(strings)
-            delta=1.0 + 12.0*len(wins) - 12.0*len(loses)
-            scores[rv]+=delta
-            if wins or loses:
-                reasons.append("%s return at IL_%04x near win=%s lose=%s -> %+g" %
-                               (rv, x["off"], [w for w in wins[:2]], [l for l in loses[:2]], delta))
-            else:
-                reasons.append("%s return at IL_%04x -> %+g" % (rv, x["off"], delta))
-        return scores,reasons
 
-    def _caller_return_value_scores(self, target_name):
-        """Infer which bool return unlocks callers by inspecting call; brtrue/brfalse."""
-        scores={True:0.0, False:0.0}; reasons=[]
-        t=target_name.lower()
-        for m in self.methods:
+    # --- branch-flip patching (mirrors native failure-branch neutralisation) ---
+
+    def _is_cond_branch(self, op):
+        return any(op.startswith(p) for p in self.COND_BRANCH_PREFIX)
+
+    def _branch_pop_count(self, op):
+        """Stack operands a conditional branch consumes (so a neutralising flip
+        can pop them and stay stack-balanced)."""
+        if op.startswith(("brtrue","brfalse")): return 1
+        if op.startswith(("beq","bne.un","bge","bgt","ble","blt")): return 2
+        return None
+
+    def _branch_flip_targets(self, methods):
+        """Select conditional branches whose TARGET side is the failure side, so
+        the branch can be neutralised in place (pop operands + nop) to fall
+        through to the win side -- a length-preserving, stack-balanced rewrite.
+        Returns (flips, skipped); `skipped` records branches whose win side is the
+        target, which cannot be forced in place without relocating code."""
+        flips=[]; skipped=[]
+        for m in methods:
+            body=m.get("body") or {}
+            if body.get("more_sects"): continue
+            code_size=int(body.get("code_size") or 0)
+            calls="\n".join(m["calls"])
+            wins0,loses0,_=self._classify_strings(m["strings"])
+            if not (wins0 or loses0 or any(x in calls for x in self.COMPARE_CALLS)
+                    or any(x in calls for x in self.SOURCE_CALLS)):
+                continue
             ins=m["ins"]; off_to_idx={x["off"]:i for i,x in enumerate(ins)}
-            for i,x in enumerate(ins[:-1]):
-                if x["op"] not in ("call","callvirt") or not x.get("text"): continue
-                cname=x["text"].split("::")[-1].lower()
-                if cname!=t: continue
-                # direct bool use: call; brtrue/brfalse next instruction
-                j=i+1
-                while j<len(ins) and ins[j]["op"]=="nop": j+=1
-                if j>=len(ins): continue
-                br=ins[j]
-                if not (br["op"].startswith("brtrue") or br["op"].startswith("brfalse")): continue
-                target_idx=off_to_idx.get(br.get("target"), j+1)
-                fall_idx=j+1
-                target_score=self._reachable_method_slice_score(m,target_idx)
-                fall_score=self._reachable_method_slice_score(m,fall_idx)
-                if br["op"].startswith("brtrue"):
-                    true_side=false_side=target_score
-                    false_side=fall_score
-                else:
-                    false_side=target_score
-                    true_side=fall_score
-                # Prefer win/lose classification. Size is only a tiny tiebreaker.
-                scores[True]+=true_side["score"]; scores[False]+=false_side["score"]
-                reasons.append("caller %s IL_%04x %s: true_score=%.2f false_score=%.2f" %
-                               (m["name"], br["off"], br["op"], true_side["score"], false_side["score"]))
-        return scores,reasons
+            for k,br in enumerate(ins):
+                op=br["op"]
+                if not self._is_cond_branch(op): continue
+                tgt=br.get("target")
+                if not isinstance(tgt,int): continue
+                t_idx=off_to_idx.get(tgt)
+                if t_idx is None: continue
+                tscore=self._reachable_method_slice_score(m, t_idx)
+                fscore=self._reachable_method_slice_score(m, k+1)
+                if (fscore["score"]-tscore["score"])>=self.FLIP_MARGIN_MIN and (tscore["loses"] or fscore["wins"]):
+                    n_pops=self._branch_pop_count(op)
+                    if n_pops is None or br["off"]+br["size"]>code_size or br["size"]<n_pops: continue
+                    flips.append((m, br, n_pops, tscore, fscore))
+                elif (tscore["score"]-fscore["score"])>=self.FLIP_MARGIN_MIN and (fscore["loses"] or tscore["wins"]):
+                    skipped.append((m, br, "win side is the branch target; in-place IL flip cannot grow the body to force it"))
+        return flips, skipped
 
-    def _infer_bool_patch_return(self, m):
-        own,own_reasons=self._method_return_value_scores(m)
-        caller,caller_reasons=self._caller_return_value_scores(m["name"])
-        scores={True:own[True]+caller[True], False:own[False]+caller[False]}
-        reasons=own_reasons+caller_reasons
-        print("  IL return inference for %s:" % m["name"])
-        print("    true score : %.2f" % scores[True])
-        print("    false score: %.2f" % scores[False])
-        for r in reasons[:10]: print("    - "+r)
-        if scores[True]==scores[False]: return None
-        return True if scores[True]>scores[False] else False
-
-    def _write_return_patch(self,methods,out_arg=None):
-        if not self.write_patch:
-            print("  IL patch write: disabled; add --write-patch for method-body replacement")
+    def _emit_branch_flips(self, flips, skipped, out_arg=None):
+        hr(".NET IL BRANCH-FLIP PATCH (force failure branches to the win side)")
+        for m,br,why in skipped:
+            print("  skip %s @ IL_%04x in %s: %s" % (br["op"], br["off"], m["name"], why))
+        if not flips:
+            print("  no in-place-flippable failure branch isolated near outcome logic")
             return False
-        if len(methods)!=1:
-            print("  IL patch write: refusing because --method matched %d methods; use an exact filter" % len(methods))
-            return False
-        m=methods[0]; body=m.get("body") or {}
-        if body.get("more_sects"):
-            print("  IL patch write: refusing method with extra EH/section metadata")
-            return False
-        code_size=int(body.get("code_size") or 0); code_off=int(body.get("code_off") or 0)
-        ret_choice=self.il_patch_return
-        if ret_choice=="auto":
-            inferred=self._infer_bool_patch_return(m)
-            if inferred is None:
-                print("  IL patch write: could not infer the desired bool return; rerun with --patch-return true|false")
-                return False
-            ret_choice="true" if inferred else "false"
-        patch = bytes([0x17 if ret_choice=="true" else 0x16, 0x2a])  # ldc.i4.1/0 ; ret
-        if code_size < len(patch):
-            print("  IL patch write: method body too small")
-            return False
-        data=bytearray(_read_file_prefix(self.primary, 1<<30))
-        data[code_off:code_off+len(patch)] = patch
-        for i in range(code_off+len(patch), code_off+code_size): data[i]=0x00  # nop padding
+        data=bytearray(_read_file_prefix(self.primary, 1<<30)); applied=0
+        for m,br,n_pops,tscore,fscore in flips:
+            foff=int(m["body"]["code_off"])+br["off"]; size=br["size"]
+            if foff+size>len(data): continue
+            for j in range(n_pops): data[foff+j]=0x26          # pop
+            for j in range(n_pops,size): data[foff+j]=0x00      # nop
+            print("  flip %s @ IL_%04x in %s -> pop x%d + nop (fall through to win side)"
+                  % (br["op"], br["off"], m["name"], n_pops))
+            if fscore["wins"]: print("       win side : %s" % ", ".join(repr(x) for x in fscore["wins"][:2]))
+            if tscore["loses"]: print("       lose side: %s" % ", ".join(repr(x) for x in tscore["loses"][:2]))
+            applied+=1
+        if not applied:
+            print("  no branch patch applied"); return False
         out=out_arg or (self.primary+".patched")
         parent=os.path.dirname(out)
         if parent: os.makedirs(parent, exist_ok=True)
         with open(out,"wb") as f: f.write(data)
-        print("  IL patch write: method %s -> return %s" % (m["name"], ret_choice))
-        print("  wrote %s (original untouched)" % out)
+        print("  applied %d branch flip(s); wrote %s (original untouched)" % (applied, out))
         return True
 
     def patch(self, out_arg=None):
-        old_plan=self.il_plan_patch
-        self.il_plan_patch=False  # avoid printing the same plan twice in --mode patch
         ok=self.report()
-        self.il_plan_patch=old_plan
         if not ok:
-            hr(".NET IL PATCH PLAN")
-            print("  no IL metadata decoder available; cannot plan IL branch rewrites")
+            hr(".NET IL PATCH")
+            print("  no IL metadata decoder available; cannot write IL patches")
             return False
         methods=self._matching_methods()
-        planned=self._patch_plan(methods)
-        if self.write_patch:
-            return self._write_return_patch(methods,out_arg=out_arg)
-        return planned
+        flips,skipped=self._branch_flip_targets(methods)
+        return self._emit_branch_flips(flips, skipped, out_arg=out_arg)
 
 def select_runtime_frontend(kind, binary, rt, options=None):
     if kind in ("dotnet-apphost","dotnet-managed"):

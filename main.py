@@ -23,7 +23,8 @@ from calltree_backends.frontend import AnalyzerFrontend, AnalyzerOptions
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="ariadne")
     ap.add_argument("binary")
-    ap.add_argument("--mode", choices=["advise", "solve", "patch", "runtime-report"], default="advise")
+    ap.add_argument("--mode", choices=["advise", "solve", "plan-patch", "patch", "runtime-report"], default="advise",
+                    help="advise=report; plan-patch=preview the branches patch would flip (writes nothing); patch=write them")
     ap.add_argument("--out", default=None)
     ap.add_argument(
         "--frontend",
@@ -34,10 +35,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--il-assembly", default=None, help="managed .NET assembly to analyze when using the dotnet-il frontend")
     ap.add_argument("--method", default=None, help="backend-neutral method/function regex or native address filter")
     ap.add_argument("--il-dump", action="store_true", help="dump decoded IL for matching managed methods")
-    ap.add_argument("--il-plan-patch", action="store_true", help="print a non-destructive IL branch rewrite plan")
-    ap.add_argument("--write-patch", action="store_true", help="write a patched copy")
-    ap.add_argument("--return-patch", action="store_true", help="patch/plan a function or method return override")
-    ap.add_argument("--patch-return", choices=["auto", "true", "false", "zero", "one"], default="auto", help="return value for --return-patch; auto infers from win/lose paths")
     ap.add_argument("--force-low-confidence", action="store_true", help="allow solve/patch even when the dominance gate looks like noise")
     ap.add_argument("--force-native-runtime", action="store_true", help="run native solve/patch even when the binary appears to be a runtime host")
     return ap
@@ -54,11 +51,13 @@ def _select_runtime_frontend(frontend: str, runtime_kind: str, binary: str, rt: 
 
 
 def _run_mode(frontend: AnalyzerFrontend, mode: str, out: str | None) -> None:
-    """Dispatch advise/solve/patch to a frontend's shared interface."""
+    """Dispatch a mode to a frontend's shared interface."""
     if mode == "solve":
         frontend.solve()
     elif mode == "patch":
         frontend.patch(out)
+    elif mode == "plan-patch":
+        frontend.plan_patch()
     else:  # advise
         frontend.report()
 

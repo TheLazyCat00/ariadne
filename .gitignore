@@ -16,6 +16,7 @@ fixtures/**/bin/
 fixtures/**/obj/
 fixtures/**/fixture.manifest.json
 fixtures/native_gate_demo/native_gate_demo
+fixtures/native_crackme/crackme_native.exe
 # patched/generated binaries
 *.patched
 *.patched.exe

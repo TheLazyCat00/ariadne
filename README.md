@@ -68,27 +68,31 @@ python main.py ./App.exe \
   --method '(License|Trial|Activation|Product|Key|Check)'
 ```
 
-Dump IL and print a non-destructive patch plan:
+Dump IL and preview the patch plan (writes nothing):
 
 ```bash
 python main.py ./App.dll \
   --frontend dotnet-il \
-  --mode advise \
+  --mode plan-patch \
   --method CheckLabKey \
-  --il-dump \
-  --il-plan-patch
+  --il-dump
 ```
 
-Shared patch flags:
+The patch-related modes form an escalation that is identical on both backends:
 
 ```text
---method REGEX_OR_ADDR       backend-neutral method/function selector
---return-patch               patch/plan a function or method return override
---patch-return auto|...      infer by default, or force true/false/zero/one
---write-patch                actually write a patched copy
+--mode advise       report only
+--mode plan-patch   report + preview exactly which branches patch would flip (writes nothing)
+--mode patch        report + write those flips toward the win side (original left untouched)
 ```
 
-All flags are backend-neutral and shared across the native and IL frontends. Without `--write-patch`, patch-capable backends print dry-run plans where possible.
+Other shared flags:
+
+```text
+--method REGEX_OR_ADDR       backend-neutral method/function selector (narrows solve/advise/patch)
+--out PATH                   where to write the patched copy
+--force-low-confidence       allow solve/patch even when the gate looks like noise
+```
 
 ## License
 
