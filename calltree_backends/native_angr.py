@@ -34,18 +34,19 @@ Boundaries worth stating plainly:
     so native solve/patch is refused by default and the tool reports likely
     payload artifacts for a runtime-specific frontend.
 """
-import sys, argparse, logging, time
+import sys, logging, time
 for n in ("angr","cle","pyvex","claripy","archinfo"):
     logging.getLogger(n).setLevel(logging.ERROR)
 import angr, claripy, networkx as nx
 import os, subprocess
-# Allow the gradually-split backend package in the workspace root to be imported
-# even when this legacy wrapper is executed as uploads/calltree_triage_new.py.
+# Allow importing the backend package when this module is loaded directly rather
+# than through main.py (which already puts the workspace root on sys.path).
 for _p in (os.getcwd(), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
     if os.path.isdir(os.path.join(_p, "calltree_backends")) and _p not in sys.path:
         sys.path.insert(0, _p)
 
 from calltree_backends.frontend import AnalyzerFrontend, AnalyzerOptions
+from calltree_backends.util import hr, read_file_prefix as _read_file_prefix, glob_limited as _glob_limited
 
 def verify_real(binary, stdin_bytes, files, envs):
     """Drive recovered inputs into the REAL binary; True iff it prints success.
@@ -99,7 +100,7 @@ def obj_of(proj, addr):
     b=(getattr(o,"binary","") or "?").rsplit("/",1)[-1]
     return (b, o is proj.loader.main_object)
 
-from calltree_backends.outcomes import WIN_WORDS, LOSE_WORDS, classify_strings
+from calltree_backends.outcomes import WIN_WORDS, LOSE_WORDS
 
 # ---------------------------------------------------------------------------
 # OS-keyed source table. This is the ONLY place the pipeline branches on OS.
@@ -132,7 +133,6 @@ def target_os(proj):
     return "linux"
 
 def base(s): return s.split("@")[0]
-def hr(t): print("\n"+"="*66+"\n  "+t+"\n"+"="*66)
 
 # ---------------------------------------------------------------------------
 # 1. LOADER: always produce a uniform call tree (libraries become nodes).
@@ -270,22 +270,6 @@ def detect_sources(proj, cfg):
 # ---------------------------------------------------------------------------
 # 3b. RUNTIME HOSTS: native launchers whose real program lives elsewhere.
 # ---------------------------------------------------------------------------
-def _read_file_prefix(path, n=16*1024*1024):
-    try:
-        with open(path,"rb") as f: return f.read(n)
-    except Exception:
-        return b""
-
-def _glob_limited(pattern, limit=24):
-    import glob
-    out=[]
-    try:
-        for x in glob.glob(pattern):
-            out.append(x)
-            if len(out)>=limit: break
-    except Exception: pass
-    return out
-
 def _existing(paths):
     out=[]; seen=set()
     for x in paths:
@@ -838,7 +822,6 @@ def find_gate_dominance(proj, cfg):
     retry-loops ("wrong key, try again") that cycle back can't hide the gate.
     Fully architecture-agnostic: a standard dominator-tree computation on the
     whole-program CFG."""
-    import networkx as nx
     from collections import deque
     g=cfg.graph
     G=nx.DiGraph()
@@ -914,21 +897,14 @@ class NativeAngrFrontend(AnalyzerFrontend):
     top-level CLI can route native targets to angr and runtime/managed targets
     to dedicated frontends.
     """
-    def __init__(self, binary, options=None, method_filter=None, return_patch=False,
-                 write_patch=False, patch_return="auto", force_low_confidence=False):
-        if options is None:
-            options=AnalyzerOptions(method_filter=method_filter,
-                                    return_patch=return_patch,
-                                    write_patch=write_patch,
-                                    patch_return=patch_return,
-                                    force_low_confidence=force_low_confidence)
-        self.options=options
+    def __init__(self, binary, options=None):
+        self.options=options or AnalyzerOptions()
         self.binary=binary
-        self.method_filter=options.method_filter
-        self.return_patch=options.return_patch
-        self.write_patch=options.write_patch
-        self.patch_return=options.native_return
-        self.force_low_confidence=options.force_low_confidence
+        self.method_filter=self.options.method_filter
+        self.return_patch=self.options.return_patch
+        self.write_patch=self.options.write_patch
+        self.patch_return=self.options.native_return
+        self.force_low_confidence=self.options.force_low_confidence
         self.proj,self.cfg=load_calltree(binary)
         self.os_,self.files,self.envs,self.regs=detect_sources(self.proj,self.cfg)
         self.gate=None
@@ -1007,9 +983,6 @@ class NativeAngrFrontend(AnalyzerFrontend):
     def report(self):
         self._print_gate_report()
         return True
-
-    def advise(self):
-        return self.report()
 
     def solve(self, force_low_confidence=None):
         if force_low_confidence is None:

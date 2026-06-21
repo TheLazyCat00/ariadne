@@ -10,25 +10,8 @@ import os
 import sys
 
 from calltree_backends.frontend import AnalyzerFrontend, AnalyzerOptions
-from calltree_backends.outcomes import WIN_WORDS, LOSE_WORDS, classify_strings
-
-def hr(t): print("\n"+"="*66+"\n  "+t+"\n"+"="*66)
-
-def _read_file_prefix(path, n=16*1024*1024):
-    try:
-        with open(path,"rb") as f: return f.read(n)
-    except Exception:
-        return b""
-
-def _glob_limited(pattern, limit=24):
-    import glob
-    out=[]
-    try:
-        for x in glob.glob(pattern):
-            out.append(x)
-            if len(out)>=limit: break
-    except Exception: pass
-    return out
+from calltree_backends.outcomes import WIN_WORDS, LOSE_WORDS
+from calltree_backends.util import hr, read_file_prefix as _read_file_prefix, glob_limited as _glob_limited
 
 # ---------------------------------------------------------------------------
 # 3c. FRONTEND ROUTING: native angr vs runtime-specific IL analyzers.
@@ -285,21 +268,12 @@ class DotNetILFrontend(AnalyzerFrontend):
     COMPARE_CALLS=("String::Equals","String::op_Equality","String::Compare","SequenceEqual","StartsWith","EndsWith","Contains")
     SINK_CALLS=("Console::WriteLine","MessageBox::Show","Environment::Exit")
 
-    def __init__(self, binary, rt=None, options=None, explicit_assembly=None,
-                 method_filter=None, il_dump=False, il_plan_patch=False,
-                 il_write_patch=False, il_patch_return="auto"):
-        if options is None:
-            options=AnalyzerOptions(method_filter=method_filter,
-                                    patch_return=il_patch_return,
-                                    write_patch=il_write_patch,
-                                    il_assembly=explicit_assembly,
-                                    il_dump=il_dump,
-                                    il_plan_patch=il_plan_patch)
-        self.options=options
-        self.binary=binary; self.rt=rt or {}; self.explicit_assembly=options.il_assembly
-        self.method_filter=options.method_filter; self.il_dump=options.il_dump
-        self.il_plan_patch=options.il_plan_patch; self.write_patch=options.write_patch
-        self.il_patch_return=options.il_return
+    def __init__(self, binary, rt=None, options=None):
+        self.options=options or AnalyzerOptions()
+        self.binary=binary; self.rt=rt or {}; self.explicit_assembly=self.options.il_assembly
+        self.method_filter=self.options.method_filter; self.il_dump=self.options.il_dump
+        self.il_plan_patch=self.options.il_plan_patch; self.write_patch=self.options.write_patch
+        self.il_patch_return=self.options.il_return
         self.assemblies=_dotnet_payload_candidates(binary,self.rt, explicit=self.explicit_assembly)
         self.primary=self.assemblies[0] if self.assemblies else None
         self.pe=None; self.dnfile_error=None; self.raw=[]; self.methods=[]
@@ -918,16 +892,7 @@ class DotNetILFrontend(AnalyzerFrontend):
             return self._write_return_patch(methods,out_arg=out_arg)
         return planned
 
-def select_runtime_frontend(kind, binary, rt, options=None, explicit_assembly=None,
-                            method_filter=None, il_dump=False, il_plan_patch=False,
-                            il_write_patch=False, il_patch_return="auto"):
-    if options is None:
-        options=AnalyzerOptions(method_filter=method_filter,
-                                patch_return=il_patch_return,
-                                write_patch=il_write_patch,
-                                il_assembly=explicit_assembly,
-                                il_dump=il_dump,
-                                il_plan_patch=il_plan_patch)
+def select_runtime_frontend(kind, binary, rt, options=None):
     if kind in ("dotnet-apphost","dotnet-managed"):
         return DotNetILFrontend(binary, rt, options=options)
     return None

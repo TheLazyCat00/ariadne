@@ -18,23 +18,16 @@ class AnalyzerOptions:
 
     @classmethod
     def from_args(cls, args) -> "AnalyzerOptions":
-        method_filter = getattr(args, "method", None) or getattr(args, "il_method", None) or getattr(args, "native_function", None)
-        patch_return = getattr(args, "patch_return", "auto")
-        if patch_return == "auto":
-            patch_return = getattr(args, "il_patch_return", "auto")
-        if patch_return == "auto":
-            patch_return = getattr(args, "native_patch_return", "auto")
-
         return cls(
-            method_filter=method_filter,
-            return_patch=bool(getattr(args, "return_patch", False) or getattr(args, "native_return_patch", False)),
-            patch_return=patch_return,
-            write_patch=bool(getattr(args, "write_patch", False) or getattr(args, "il_write_patch", False)),
-            il_assembly=getattr(args, "il_assembly", None),
-            il_dump=bool(getattr(args, "il_dump", False)),
-            il_plan_patch=bool(getattr(args, "il_plan_patch", False)),
-            force_low_confidence=bool(getattr(args, "force_low_confidence", False)),
-            force_native_runtime=bool(getattr(args, "force_native_runtime", False)),
+            method_filter=args.method,
+            return_patch=bool(args.return_patch),
+            patch_return=args.patch_return,
+            write_patch=bool(args.write_patch),
+            il_assembly=args.il_assembly,
+            il_dump=bool(args.il_dump),
+            il_plan_patch=bool(args.il_plan_patch),
+            force_low_confidence=bool(args.force_low_confidence),
+            force_native_runtime=bool(args.force_native_runtime),
         )
 
     @property

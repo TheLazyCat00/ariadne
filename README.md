@@ -88,7 +88,7 @@ Shared patch flags:
 --write-patch                actually write a patched copy
 ```
 
-Backend-specific historical aliases still parse for existing scripts, but new usage should prefer the shared flags above. Without `--write-patch`, patch-capable backends print dry-run plans where possible.
+All flags are backend-neutral and shared across the native and IL frontends. Without `--write-patch`, patch-capable backends print dry-run plans where possible.
 
 ## License
 
