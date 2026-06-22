@@ -60,7 +60,9 @@ def verify_real(binary, stdin_bytes, files, envs):
     both relative and absolute target paths."""
     binpath=os.path.abspath(binary)
     run_cwd=os.path.dirname(binpath) or os.getcwd()
-    env=os.environ.copy(); env["LD_LIBRARY_PATH"]=run_cwd
+    env=os.environ.copy()
+    existing_ld=env.get("LD_LIBRARY_PATH")
+    env["LD_LIBRARY_PATH"]=run_cwd+os.pathsep+existing_ld if existing_ld else run_cwd
     for k,v in envs.items(): env[k]=v
     written=[]
     try:
@@ -267,11 +269,23 @@ def recover_named(proj, cfg, mo, api, reg):
         parts=[p.strip() for p in (op_str or "").split(",", 1)]
         return (parts[0], parts[1]) if len(parts)==2 else (parts[0] if parts else "", "")
 
+    # Compilers frequently stage pointer args through the 32-bit sub-register
+    # (e.g. `mov edi, eax` for an integer arg), so normalise to the 64-bit name
+    # before comparing/tracking registers.
+    _REG64={
+        "edi":"rdi","esi":"rsi","edx":"rdx","ecx":"rcx","eax":"rax","ebx":"rbx",
+        "ebp":"rbp","esp":"rsp",
+        "r8d":"r8","r9d":"r9","r10d":"r10","r11d":"r11","r12d":"r12",
+        "r13d":"r13","r14d":"r14","r15d":"r15",
+    }
+    def _norm(r): return _REG64.get(r, r)
+
     def _read_rip_string(ins):
         m=rip_pat.search(ins.op_str or "")
         if not m: return None
         try:
-            disp=int(m.group(2),16)
+            val=m.group(2)
+            disp=int(val,16) if (val.startswith("0x") or any(c in val.lower() for c in "abcdef")) else int(val,10)
             if m.group(1)=="-": disp=-disp
             tgt=ins.address+ins.size+disp
             s=read_wstr(proj,tgt) if wide else read_cstr(proj,tgt)
@@ -288,16 +302,19 @@ def recover_named(proj, cfg, mo, api, reg):
                 insns=list(pred.block.capstone.insns)
             except Exception:
                 continue
-            wanted={reg}
+            wanted={_norm(reg)}
             for ins in reversed(insns):
                 dst,src=_split_ops(ins.op_str)
-                if ins.mnemonic=="lea" and dst in wanted:
+                dst_n,src_n=_norm(dst),_norm(src)
+                if ins.mnemonic=="lea" and dst_n in wanted:
                     s=_read_rip_string(ins)
                     if s: out.append(s)
                     break
-                if ins.mnemonic=="mov" and dst in wanted and src and "[" not in src:
-                    wanted.remove(dst)
-                    wanted.add(src)
+                # Track plain and width-extending register copies (mov/movsxd/
+                # movzx/movsx); ignore memory loads.
+                if ins.mnemonic.startswith("mov") and dst_n in wanted and src and "[" not in src:
+                    wanted.discard(dst_n)
+                    wanted.add(src_n)
     return out
 
 def detect_sources(proj, cfg):
