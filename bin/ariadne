@@ -2,4 +2,4 @@
 # Resolve main.py relative to this script without changing the caller's working
 # directory, so relative target paths (e.g. ./crackme) still resolve.
 DIR="$(cd "$(dirname "$0")" && pwd)"
-exec python "$DIR/../main.py" "$@"
+exec python3 "$DIR/../main.py" "$@"
