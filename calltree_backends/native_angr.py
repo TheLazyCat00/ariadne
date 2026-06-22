@@ -37,8 +37,12 @@ Boundaries worth stating plainly:
 import sys, logging, time
 for n in ("angr","cle","pyvex","claripy","archinfo"):
     logging.getLogger(n).setLevel(logging.ERROR)
+# Missing unicorn bindings are a common, non-fatal speed-path issue in sandboxed
+# environments; keep that specific logger quiet so solve/patch output stays about
+# the analysis result rather than an optional accelerator.
+logging.getLogger("angr.state_plugins.unicorn_engine").setLevel(logging.CRITICAL)
 import angr, claripy, networkx as nx
-import os, subprocess
+import os, shutil, subprocess
 # Allow importing the backend package when this module is loaded directly rather
 # than through main.py (which already puts the workspace root on sys.path).
 for _p in (os.getcwd(), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
@@ -51,17 +55,26 @@ from calltree_backends.gates import GateCandidate, render_plan
 
 def verify_real(binary, stdin_bytes, files, envs):
     """Drive recovered inputs into the REAL binary; True iff it prints success.
-    Linux-host only (executes ./binary directly)."""
-    env=os.environ.copy(); env["LD_LIBRARY_PATH"]="."
+    Linux-host only. Runs the target from its own directory so relative file
+    reads and sibling-library lookups behave like a normal launch, and supports
+    both relative and absolute target paths."""
+    binpath=os.path.abspath(binary)
+    run_cwd=os.path.dirname(binpath) or os.getcwd()
+    env=os.environ.copy(); env["LD_LIBRARY_PATH"]=run_cwd
     for k,v in envs.items(): env[k]=v
     written=[]
     try:
         for path,content in files.items():
+            real_path=path if os.path.isabs(path) else os.path.join(run_cwd, path)
             try:
-                with open(path,"wb") as f: f.write(content); written.append(path)
-            except Exception: pass
-        r=subprocess.run(["./"+binary.lstrip("./")], input=stdin_bytes,
-                         capture_output=True, timeout=6, env=env)
+                parent=os.path.dirname(real_path)
+                if parent: os.makedirs(parent, exist_ok=True)
+                with open(real_path,"wb") as f: f.write(content)
+                written.append(real_path)
+            except Exception:
+                pass
+        r=subprocess.run([binpath], input=stdin_bytes,
+                         capture_output=True, timeout=6, env=env, cwd=run_cwd)
         out=r.stdout.lower()
         return (b"unlicensed" not in out) and len(out.strip())>0 and any(w in out for w in [b"toolkit",b"sum=",b"bucket",b"correct",b"notes",b"granted",b"welcome",
                                       b"thank you",b"licensed",b"unlocked"])
@@ -235,28 +248,56 @@ def outcome_sinks(proj, cfg):
 # 3. SOURCES: input nodes (uniform; stdin always assumed). Table-driven per OS.
 # ---------------------------------------------------------------------------
 def recover_named(proj, cfg, mo, api, reg):
-    """Recover the string passed in `reg` at each call site of `api`. Uniform
-    across loaders: an ELF PLT entry lives in the main object, while a PE import
-    is modelled as BOTH an in-range IAT thunk (whose predecessor is just padding)
-    and an out-of-range SimProcedure stub (whose predecessor is the real caller
-    with the `lea reg,[rip+...]`). We therefore union predecessors over EVERY cfg
-    function named `api` rather than picking one stub by address range."""
+    """Recover the string passed in `reg` at each call site of `api`.
+
+    Handles the direct `lea <argreg>, [rip+...]` shape and the very common
+    one-hop register copy produced by compilers, e.g. `lea rax, [...] ; mov rdi,
+    rax ; call getenv`. Uniform across loaders: an ELF PLT entry lives in the
+    main object, while a PE import is modelled as BOTH an in-range IAT thunk
+    (whose predecessor is just padding) and an out-of-range SimProcedure stub
+    (whose predecessor is the real caller). We therefore union predecessors over
+    EVERY cfg function named `api` rather than picking one stub by address range."""
+    import re
     out=[]; wide=_is_wide(api); seen=set()
     nodes=[cfg.model.get_any_node(f.addr) for f in cfg.functions.values()
            if f.name==api]
+    rip_pat=re.compile(r"\[rip\s*([+-])\s*(0x[0-9a-fA-F]+|[0-9a-fA-F]+)\]")
+
+    def _split_ops(op_str):
+        parts=[p.strip() for p in (op_str or "").split(",", 1)]
+        return (parts[0], parts[1]) if len(parts)==2 else (parts[0] if parts else "", "")
+
+    def _read_rip_string(ins):
+        m=rip_pat.search(ins.op_str or "")
+        if not m: return None
+        try:
+            disp=int(m.group(2),16)
+            if m.group(1)=="-": disp=-disp
+            tgt=ins.address+ins.size+disp
+            s=read_wstr(proj,tgt) if wide else read_cstr(proj,tgt)
+            return s.decode("latin1") if s else None
+        except Exception:
+            return None
+
     for node in nodes:
         if node is None: continue
         for pred in cfg.model.get_predecessors(node):
             if pred.addr in seen: continue
             seen.add(pred.addr)
-            for ins in pred.block.capstone.insns:
-                if ins.mnemonic=="lea" and ins.op_str.startswith(reg+",") and "rip +" in ins.op_str:
-                    try:
-                        disp=int(ins.op_str.split("rip +")[1].split("]")[0].strip(),16)
-                        tgt=ins.address+ins.size+disp
-                        s=read_wstr(proj,tgt) if wide else read_cstr(proj,tgt)
-                        if s: out.append(s.decode("latin1"))
-                    except Exception: pass
+            try:
+                insns=list(pred.block.capstone.insns)
+            except Exception:
+                continue
+            wanted={reg}
+            for ins in reversed(insns):
+                dst,src=_split_ops(ins.op_str)
+                if ins.mnemonic=="lea" and dst in wanted:
+                    s=_read_rip_string(ins)
+                    if s: out.append(s)
+                    break
+                if ins.mnemonic=="mov" and dst in wanted and src and "[" not in src:
+                    wanted.remove(dst)
+                    wanted.add(src)
     return out
 
 def detect_sources(proj, cfg):
@@ -752,7 +793,8 @@ def apply_branch_patches(proj, decisions, out_arg=None, title=None,
         print("  object       : %s%s" % (nm, "  (main executable)" if is_main
                                       else "  (DEPENDENCY -- patching the library, not the app)"))
         try:
-            data=bytearray(open(binpath,"rb").read())
+            with open(binpath,"rb") as f:
+                data=bytearray(f.read())
         except Exception as e:
             print("    could not read %s: %s" % (binpath, e)); continue
         applied=0
@@ -771,7 +813,12 @@ def apply_branch_patches(proj, decisions, out_arg=None, title=None,
         out=_out_for_object(obj, out_arg, len(groups), used_out)
         parent=os.path.dirname(out)
         if parent: os.makedirs(parent, exist_ok=True)
-        open(out,"wb").write(data)
+        with open(out,"wb") as f:
+            f.write(data)
+        try:
+            shutil.copymode(binpath, out)
+        except Exception:
+            pass
         print("    wrote %s with %d branch patch(es) (original untouched)" % (out, applied))
         if not is_main:
             print("    NB: to use it, replace the library the app loads with %s"
@@ -1008,15 +1055,13 @@ class NativeAngrFrontend(AnalyzerFrontend):
         return gate, low_conf, False
 
     def _solve_target(self, gate):
-        win={gate["win"]}
-        gate_fn=self.cfg.functions.floor_func(gate["branch"])
-        body=None
-        for f in self.cfg.functions.values():
-            if not _is_ours(self.proj,f.addr): continue
-            if gate_fn and f.addr==gate_fn.addr: continue
-            if (f.size or 0)<30: continue
-            if body is None or (f.size or 0)>(body.size or 0): body=f
-        return {body.addr} if body else win
+        """Prefer real outcome sinks when available; otherwise solve to the gate's
+        unlocked successor. This avoids targeting unrelated large helper/init
+        functions, which creates spurious symbolic "solutions"."""
+        self.sink_win,self.sink_lose,_seen=outcome_sinks(self.proj,self.cfg)
+        if self.sink_win:
+            return set(self.sink_win)
+        return {gate["win"]}
 
     def report(self):
         self._print_gate_report()
@@ -1102,7 +1147,7 @@ class NativeAngrFrontend(AnalyzerFrontend):
                   " --force-low-confidence only for an authorized research target.")
             print(); return False
         solve_win=self._solve_target(gate)
-        lose={gate["lose"]}
+        lose=set(self.sink_lose) if self.sink_lose else {gate["lose"]}
         solve(self.proj,self.cfg,solve_win,lose,self.files,self.envs,self.regs,self.binary,os_=self.os_)
         return True
 

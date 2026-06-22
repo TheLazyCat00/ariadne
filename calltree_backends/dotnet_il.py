@@ -7,6 +7,7 @@ Patch mode rewrites failure-only conditional branches in place (stack-balanced
 `pop`+`nop`) toward the win side; --mode plan-patch shows a non-destructive preview.
 """
 import os
+import shutil
 import sys
 
 from calltree_backends.frontend import AnalyzerFrontend, AnalyzerOptions
@@ -43,7 +44,11 @@ def _raw_strings(data, minlen=4, maxlen=220):
 def _is_dotnet_cli_file(path):
     data=_read_file_prefix(path, 32*1024*1024)
     low=data.lower()
-    return (b"bsjb" in data) or (b"mscoree.dll" in low) or (b"_cor" in low and b"metadata" in low)
+    # The ECMA-335 metadata signature is the four ASCII bytes "BSJB" (0x424A5342
+    # little-endian); it is case-sensitive in the spec, so check the raw bytes for
+    # it directly.  The other heuristics are case-insensitive (PE imports/strings),
+    # so they look at `low`.
+    return (b"BSJB" in data) or (b"mscoree.dll" in low) or (b"_cor" in low and b"metadata" in low)
 
 DOTNET_RUNTIME_ASM_PREFIXES=(
     "system.", "microsoft.", "windows.", "communitytoolkit.", "winrt.",
@@ -1229,6 +1234,10 @@ class DotNetILFrontend(AnalyzerFrontend):
         parent=os.path.dirname(out)
         if parent: os.makedirs(parent, exist_ok=True)
         with open(out,"wb") as f: f.write(data)
+        try:
+            shutil.copymode(self.primary, out)
+        except Exception:
+            pass
         self._last_force_out=out; self._last_force_count=applied
         return True, cands
 
@@ -1303,6 +1312,10 @@ class DotNetILFrontend(AnalyzerFrontend):
         parent=os.path.dirname(out)
         if parent: os.makedirs(parent, exist_ok=True)
         with open(out,"wb") as f: f.write(data)
+        try:
+            shutil.copymode(self.primary, out)
+        except Exception:
+            pass
         print("  applied %d branch flip(s); wrote %s (original untouched)" % (applied, out))
         return True
 
