@@ -47,6 +47,7 @@ for _p in (os.getcwd(), os.path.dirname(os.path.dirname(os.path.abspath(__file__
 
 from calltree_backends.frontend import AnalyzerFrontend, AnalyzerOptions
 from calltree_backends.util import hr, read_file_prefix as _read_file_prefix, glob_limited as _glob_limited
+from calltree_backends.gates import GateCandidate, render_plan
 
 def verify_real(binary, stdin_bytes, files, envs):
     """Drive recovered inputs into the REAL binary; True iff it prints success.
@@ -873,6 +874,60 @@ def patch_gate(proj, gate, src=None, out_arg=None):
         empty_msg="no dominance gate branch selected")
 
 
+# ---------------------------------------------------------------------------
+# Taint qualification for the dominance gate (parity with the .NET gate path).
+# Native has no typed booleans (C/C++ name-mangling makes the .NET overload trick
+# irrelevant here), so the gate stays branch-level. What carries over is the
+# QUALIFICATION: a gate matters when its condition is derived from an external
+# source. We approximate that structurally -- a source-API call site must
+# DOMINATE the gate (i.e. it must execute before every path that reaches the
+# gate) -- which is the typeless analogue of ".NET local is source-tainted".
+# ---------------------------------------------------------------------------
+SOURCE_APIS = {
+    "getenv","secure_getenv","GetEnvironmentVariableA","GetEnvironmentVariableW",
+    "fopen","fopen64","open","open64","openat","CreateFileA","CreateFileW","_wfopen",
+    "fgets","gets","getline","scanf","__isoc99_scanf","fscanf","__isoc99_fscanf",
+    "read","fread","getchar","fgetc","recv","recvfrom","ReadFile",
+    "RegQueryValueExA","RegQueryValueExW","RegGetValueA","RegGetValueW",
+}
+
+def _source_call_sites(proj, cfg):
+    """Map {call-site node addr -> source api} for every call to a source API."""
+    sites={}
+    for f in cfg.functions.values():
+        base=(f.name or "").split("@")[0]
+        if base not in SOURCE_APIS: continue
+        node=cfg.model.get_any_node(f.addr)
+        if node is None: continue
+        for pred in cfg.model.get_predecessors(node):
+            sites.setdefault(pred.addr, base)
+    return sites
+
+def gate_source_taint(proj, cfg, gate):
+    """(tainted, source): is a source-API call site a dominator of the gate? This
+    is the structural taint check -- the gate condition must derive from input
+    that was read upstream of the branch on every path."""
+    if not gate: return False, None
+    sites=_source_call_sites(proj, cfg)
+    if not sites: return False, None
+    G=nx.DiGraph()
+    for u in cfg.graph.nodes():
+        for v in cfg.graph.successors(u): G.add_edge(u,v)
+    entry=cfg.model.get_any_node(proj.entry)
+    gnode=cfg.model.get_any_node(gate["branch"])
+    if entry is None or gnode is None or entry not in G or gnode not in G:
+        return False, None
+    try: idom=nx.immediate_dominators(G, entry)
+    except Exception: return False, None
+    cur=gnode; seen=set()
+    while cur is not None and id(cur) not in seen:     # walk gate -> ... -> entry
+        seen.add(id(cur))
+        if cur.addr in sites: return True, sites[cur.addr]
+        nxt=idom.get(cur)
+        if nxt is cur: break
+        cur=nxt
+    return False, None
+
 
 # ---------------------------------------------------------------------------
 # Native angr frontend wrapper (used by the refactored top-level CLI)
@@ -970,7 +1025,42 @@ class NativeAngrFrontend(AnalyzerFrontend):
     def plan_patch(self):
         self._print_gate_report()
         self._print_patch_plan()
+        self._print_gate_taint_plan()
         return True
+
+    def _gate_candidates_neutral(self):
+        """Lower the native dominance gate to the shared GateCandidate, qualified
+        by dominator-chain taint. Native stays branch-level (no typed value to
+        force), which the shared model captures via force_value=None."""
+        gate=self._ensure_gate()
+        if not gate: return []
+        jmp=gate["jmp"]
+        try: jtarget=int(jmp.op_str,16)
+        except Exception: jtarget=None
+        take=(gate["win"]==jtarget)            # is the unlocked side reached by jumping?
+        tainted,source=gate_source_taint(self.proj,self.cfg,gate)
+        fn=self.cfg.functions.floor_func(gate["branch"])
+        unit=(fn.name if fn else None) or ("sub_%x" % gate["branch"])
+        notes=["native gate is branch-level (no typed bool); patched by forcing the"
+               " conditional, not a value"]
+        if not tainted:
+            notes.append("no source-API call site dominates the gate; taint UNCONFIRMED"
+                         " (gate kept on dominance significance alone)")
+        return [GateCandidate(
+            backend="native", unit=unit, kind="dominance",
+            gate_locator="%s @ %#x" % (jmp.mnemonic, jmp.address),
+            gate_sites=["%#x" % jmp.address],
+            tainted=tainted, source=source, flows_through=[],
+            licensed_side=("take jump -> %#x" % gate["win"]) if take
+                          else ("fall through -> %#x" % gate["win"]),
+            significance=gate.get("pct"),
+            patch_target="force %s @ %#x toward the unlocked side (%s)"
+                         % (jmp.mnemonic, jmp.address, "TAKE" if take else "SKIP"),
+            force_value=None, notes=notes)]
+
+    def _print_gate_taint_plan(self):
+        return render_plan("NATIVE TAINTED-GATE PLAN (typeless; preview, no bytes written)",
+                           self._gate_candidates_neutral())
 
     def _print_patch_plan(self):
         """Non-destructive preview of the branches `--mode patch` would
