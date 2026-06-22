@@ -73,8 +73,11 @@ def main(argv=None) -> int:
     if not target or not target.strip():
         print("ariadne: error: no target binary given (empty path)", file=sys.stderr)
         return 2
-    if not os.path.isfile(target):
+    if not os.path.exists(target):
         print("ariadne: error: target binary not found: %r" % target, file=sys.stderr)
+        return 2
+    if not os.path.isfile(target):
+        print("ariadne: error: target %r is not a regular file" % target, file=sys.stderr)
         return 2
 
     # Import angr-backed native code lazily so `--help` and pure metadata tooling
