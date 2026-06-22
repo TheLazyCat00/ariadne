@@ -231,12 +231,15 @@ def test_branch_flip_emit_is_length_preserving():
     ]
     code, m = build_method(_decode_cil, "M", prog)
     with tempfile.TemporaryDirectory() as d:
-        prim = os.path.join(d, "raw.dll"); open(prim, "wb").write(code)
+        prim = os.path.join(d, "raw.dll")
+        with open(prim, "wb") as f:
+            f.write(code)
         fe.primary = prim
         flips, skipped = fe._branch_flip_targets([m])
         wrote = fe._emit_branch_flips(flips, skipped, out_arg=os.path.join(d, "out.dll"))
         check(wrote, "branch-flip emit reports success")
-        patched = open(os.path.join(d, "out.dll"), "rb").read()
+        with open(os.path.join(d, "out.dll"), "rb") as f:
+            patched = f.read()
         check(len(patched) == len(code), "patched file is length-preserving")
         # The branch instruction should now be `pop` (0x26) + `nop` (0x00).
         br = flips[0][1]

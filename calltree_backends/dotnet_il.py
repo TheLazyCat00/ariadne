@@ -1234,10 +1234,11 @@ class DotNetILFrontend(AnalyzerFrontend):
         parent=os.path.dirname(out)
         if parent: os.makedirs(parent, exist_ok=True)
         with open(out,"wb") as f: f.write(data)
-        try:
-            shutil.copymode(self.primary, out)
-        except Exception:
-            pass
+        if self.primary:
+            try:
+                shutil.copymode(self.primary, out)
+            except Exception:
+                pass
         self._last_force_out=out; self._last_force_count=applied
         return True, cands
 
@@ -1312,10 +1313,11 @@ class DotNetILFrontend(AnalyzerFrontend):
         parent=os.path.dirname(out)
         if parent: os.makedirs(parent, exist_ok=True)
         with open(out,"wb") as f: f.write(data)
-        try:
-            shutil.copymode(self.primary, out)
-        except Exception:
-            pass
+        if self.primary:
+            try:
+                shutil.copymode(self.primary, out)
+            except Exception:
+                pass
         print("  applied %d branch flip(s); wrote %s (original untouched)" % (applied, out))
         return True
 

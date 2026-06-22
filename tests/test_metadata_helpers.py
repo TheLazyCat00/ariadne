@@ -102,9 +102,12 @@ def test_payload_candidates_prefers_basename_dll():
         primary = os.path.join(d, "MyApp.dll")
         other = os.path.join(d, "MyLib.dll")
         # Apphost: not CLI. Payloads: minimal BSJB stub so detection passes.
-        open(host, "wb").write(b"MZ" + b"\x00" * 64)
-        open(primary, "wb").write(b"BSJB" + b"\x00" * 512)
-        open(other, "wb").write(b"BSJB" + b"\x00" * 512)
+        with open(host, "wb") as f:
+            f.write(b"MZ" + b"\x00" * 64)
+        with open(primary, "wb") as f:
+            f.write(b"BSJB" + b"\x00" * 512)
+        with open(other, "wb") as f:
+            f.write(b"BSJB" + b"\x00" * 512)
         cands = _dotnet_payload_candidates(host, rt={})
         check(primary in cands, "primary .dll discovered: %r" % cands)
         check(other in cands, "other .dll also discovered: %r" % cands)
@@ -117,8 +120,10 @@ def test_payload_candidates_explicit_overrides_filter():
     with tempfile.TemporaryDirectory() as d:
         host = os.path.join(d, "MyApp.exe")
         sysdll = os.path.join(d, "System.Custom.dll")
-        open(host, "wb").write(b"MZ" + b"\x00" * 64)
-        open(sysdll, "wb").write(b"BSJB" + b"\x00" * 512)
+        with open(host, "wb") as f:
+            f.write(b"MZ" + b"\x00" * 64)
+        with open(sysdll, "wb") as f:
+            f.write(b"BSJB" + b"\x00" * 512)
         cands = _dotnet_payload_candidates(host, rt={}, explicit=sysdll)
         check(sysdll in cands, "explicit framework-named dll selected: %r" % cands)
         # And without explicit, it would be filtered out:

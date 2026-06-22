@@ -74,7 +74,9 @@ def test_emit_refuses_when_no_force_const():
     check(len(cands) == 1, "still finds the gate candidate")
     check(cands[0]["force_const"] is None, "force_const remains None when helper unmodelled")
     with tempfile.TemporaryDirectory() as d:
-        prim = os.path.join(d, "x.dll"); open(prim, "wb").write(code)
+        prim = os.path.join(d, "x.dll")
+        with open(prim, "wb") as f:
+            f.write(code)
         fe.primary = prim
         out = os.path.join(d, "x.patched.dll")
         wrote, _ = fe._emit_gate_forces([m], out_arg=out)
