@@ -1005,29 +1005,34 @@ class DotNetILFrontend(AnalyzerFrontend):
         if not ins: return None
         off_to_idx={x["off"]:i for i,x in enumerate(ins)}
         st=[]; pc=0; steps=0
-        while 0<=pc<len(ins) and steps<max_steps:
-            steps+=1; x=ins[pc]; op=x["op"]; npc=pc+1
-            if op=="nop": pc=npc; continue
-            if op in ("ldarg.0","ldarg.s","ldarg"): st.append(int(arg)); pc=npc; continue
-            if op in ("ldarg.1","ldarg.2","ldarg.3"): st.append(0); pc=npc; continue
-            if op.startswith("ldc.i4"): st.append(self._LDC.get(op, x.get("operand") or 0)); pc=npc; continue
-            if op=="neg": st.append(-st.pop()); pc=npc; continue
-            if op=="not": st.append(~st.pop()); pc=npc; continue
-            if op=="dup": st.append(st[-1]); pc=npc; continue
-            if op=="pop": st.pop(); pc=npc; continue
-            if op=="ceq": b=st.pop(); a=st.pop(); st.append(1 if a==b else 0); pc=npc; continue
-            if op in ("cgt","cgt.un"): b=st.pop(); a=st.pop(); st.append(1 if a>b else 0); pc=npc; continue
-            if op in ("clt","clt.un"): b=st.pop(); a=st.pop(); st.append(1 if a<b else 0); pc=npc; continue
-            if op in ("add","sub","mul","and","or","xor"):
-                b=st.pop(); a=st.pop()
-                st.append({"add":a+b,"sub":a-b,"mul":a*b,"and":a&b,"or":a|b,"xor":a^b}[op]); pc=npc; continue
-            if op in ("br.s","br"): pc=off_to_idx.get(x.get("target"),npc); continue
-            if op.startswith("brtrue"):
-                v=st.pop(); pc=off_to_idx.get(x.get("target"),npc) if v!=0 else npc; continue
-            if op.startswith("brfalse"):
-                v=st.pop(); pc=off_to_idx.get(x.get("target"),npc) if v==0 else npc; continue
-            if op=="ret": return st.pop() if st else 0
-            return None                               # unmodelled op -> give up
+        try:
+            while 0<=pc<len(ins) and steps<max_steps:
+                steps+=1; x=ins[pc]; op=x["op"]; npc=pc+1
+                if op=="nop": pc=npc; continue
+                if op in ("ldarg.0","ldarg.s","ldarg"): st.append(int(arg)); pc=npc; continue
+                if op in ("ldarg.1","ldarg.2","ldarg.3"): st.append(0); pc=npc; continue
+                if op.startswith("ldc.i4"): st.append(self._LDC.get(op, x.get("operand") or 0)); pc=npc; continue
+                if op=="neg": st.append(-st.pop()); pc=npc; continue
+                if op=="not": st.append(~st.pop()); pc=npc; continue
+                if op=="dup": st.append(st[-1]); pc=npc; continue
+                if op=="pop": st.pop(); pc=npc; continue
+                if op=="ceq": b=st.pop(); a=st.pop(); st.append(1 if a==b else 0); pc=npc; continue
+                if op in ("cgt","cgt.un"): b=st.pop(); a=st.pop(); st.append(1 if a>b else 0); pc=npc; continue
+                if op in ("clt","clt.un"): b=st.pop(); a=st.pop(); st.append(1 if a<b else 0); pc=npc; continue
+                if op in ("add","sub","mul","and","or","xor"):
+                    b=st.pop(); a=st.pop()
+                    st.append({"add":a+b,"sub":a-b,"mul":a*b,"and":a&b,"or":a|b,"xor":a^b}[op]); pc=npc; continue
+                if op in ("br.s","br"): pc=off_to_idx.get(x.get("target"),npc); continue
+                if op.startswith("brtrue"):
+                    v=st.pop(); pc=off_to_idx.get(x.get("target"),npc) if v!=0 else npc; continue
+                if op.startswith("brfalse"):
+                    v=st.pop(); pc=off_to_idx.get(x.get("target"),npc) if v==0 else npc; continue
+                if op=="ret": return st.pop() if st else 0
+                return None                               # unmodelled op -> give up
+        except Exception:
+            # Stack underflow / bad operand on a malformed or obfuscated helper:
+            # bail out and leave the force constant unresolved rather than crash.
+            return None
         return None
 
     def _gate_helper_chain(self, ins, block, term_idx, li):
