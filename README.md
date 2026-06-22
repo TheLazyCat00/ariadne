@@ -26,6 +26,9 @@ calltree_backends/
   dotnet_il.py                      # .NET IL frontend
   frontend.py                       # shared frontend options/interface
   outcomes.py                       # shared win/lose string heuristics
+  gates.py                          # shared gate model + plan renderer (parity layer)
+fixtures/                           # owned crackme fixtures for both backends
+tests/                             # synthetic-IL regression tests (no SDK required)
 ```
 
 ## Install dependencies

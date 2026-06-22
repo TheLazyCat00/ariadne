@@ -12,6 +12,7 @@ import sys
 from calltree_backends.frontend import AnalyzerFrontend, AnalyzerOptions
 from calltree_backends.outcomes import WIN_WORDS, LOSE_WORDS
 from calltree_backends.util import hr, read_file_prefix as _read_file_prefix, glob_limited as _glob_limited
+from calltree_backends.gates import GateCandidate, significance, pick_licensed, render_plan
 
 # ---------------------------------------------------------------------------
 # 3c. FRONTEND ROUTING: native angr vs runtime-specific IL analyzers.
@@ -514,7 +515,10 @@ class DotNetILFrontend(AnalyzerFrontend):
         ok=self.report()
         if not ok:
             return False
-        return self._patch_plan(self._matching_methods())
+        methods=self._matching_methods()
+        flipped=self._patch_plan(methods)
+        gated=self._gate_taint_plan(methods)
+        return flipped or gated
 
     def _v_int(self,n): return {"k":"int","v":int(n)}
     def _v_str(self,s): return {"k":"str","v":s}
@@ -815,6 +819,420 @@ class DotNetILFrontend(AnalyzerFrontend):
         return {"score":score,"wins":wins,"loses":loses,"count":count,"rets":rets}
 
 
+    # --- tainted-bool gate analysis (generic gate-expression patch planning) ---
+    #
+    # This is the "find the shared gate sub-expression, prove it is source-tainted
+    # and gate-only, then patch its definition" path. Unlike the branch-flip plan
+    # (which neutralises one conditional at a time), this looks for a boolean LOCAL
+    # that (a) is tainted by an external source, (b) is bool-typed, and (c) is used
+    # ONLY in gatekeeping conditions. Such a local can be forced at its single
+    # definition site to open every gate that shares it, without disturbing
+    # unrelated code -- and crucially without patching any overloaded helper
+    # (e.g. Flip) that the local merely flows THROUGH. The gate-only test is the
+    # safety proof that forcing the definition has no effect outside the gates.
+    #
+    # The search stops at this boolean gate-only node; it does NOT keep walking
+    # down the expression tree to the ultimate source (license -> getenv). Taint
+    # is only a provenance check ("did this value originate outside"), never the
+    # patch target -- the patch target is the boolean part that is gate-only.
+    #
+    # Scope: intraprocedural, basic-block granular. Taint and bool-typing are
+    # approximated from the producing instructions inside each block, and "used
+    # only in gatekeeping context" means every block that loads the local ends in
+    # a conditional branch. The force constant is resolved by concretely evaluating
+    # any flow-through helper (e.g. Flip) on {0,1}; the def-site value region is
+    # then overwritten in a length-preserving, stack-balanced way (nop fill +
+    # ldc.i4.<const>). An inlined gate (no stored local) is recognised too and
+    # routed to branch neutralisation, since it has no definition to force.
+
+    @staticmethod
+    def _is_ldloc(op): return op.startswith("ldloc") and not op.startswith("ldloca")
+    @staticmethod
+    def _is_stloc(op): return op.startswith("stloc")
+
+    def _local_index(self, x):
+        op=x["op"]
+        if op in ("ldloc.0","ldloc.1","ldloc.2","ldloc.3",
+                  "stloc.0","stloc.1","stloc.2","stloc.3"):
+            return int(op[-1])
+        if op in ("ldloc.s","stloc.s","ldloca.s","ldloc","stloc","ldloca"):
+            o=x.get("operand"); return int(o) if isinstance(o,int) else None
+        return None
+
+    def _basic_blocks(self, ins):
+        """Split a decoded method into basic blocks. Returns (blocks, off_to_idx)
+        where blocks is a list of (start_idx, end_idx_exclusive)."""
+        off_to_idx={x["off"]:i for i,x in enumerate(ins)}
+        leaders={0}
+        for i,x in enumerate(ins):
+            op=x["op"]
+            is_term=(op in ("br.s","br","ret","throw","leave","leave.s")
+                     or self._is_cond_branch(op) or op=="switch")
+            if not is_term: continue
+            if i+1 < len(ins): leaders.add(i+1)
+            tgt=x.get("target")
+            if isinstance(tgt,int) and tgt in off_to_idx: leaders.add(off_to_idx[tgt])
+            elif isinstance(tgt,list):
+                for t in tgt:
+                    if t in off_to_idx: leaders.add(off_to_idx[t])
+        starts=sorted(leaders)
+        blocks=[(s, (starts[i+1] if i+1<len(starts) else len(ins)))
+                for i,s in enumerate(starts)]
+        return blocks, off_to_idx
+
+    def _value_is_bool_producer(self, x):
+        """Approximate: does this instruction push a boolean result? Comparison
+        opcodes and (in)equality/compare helpers do; loads and arithmetic do not.
+        This is what keeps a string/int local from being mistaken for a gate bool."""
+        op=x["op"]
+        if op in ("ceq","cgt","cgt.un","clt","clt.un"): return True
+        if op in ("call","callvirt"):
+            t=x.get("text") or ""
+            if t.endswith("op_Equality") or t.endswith("op_Inequality"): return True
+            if any(c in t for c in self.COMPARE_CALLS): return True
+        return False
+
+    def _def_is_bool(self, ins, blk_start, def_idx):
+        """A stloc defines a bool if the nearest value-producer before it (within
+        the same block) pushes a boolean."""
+        j=def_idx-1
+        while j>=blk_start and ins[j]["op"]=="nop": j-=1
+        return j>=blk_start and self._value_is_bool_producer(ins[j])
+
+    def _source_taint_by_local(self, ins, blocks):
+        """Fixpoint over basic blocks: which locals hold a value derived from an
+        external SOURCE call. Taint enters at a SOURCE call and flows into the next
+        stloc; loading an already-tainted local re-introduces the taint, so a
+        compare-of-a-tainted-local stored to a bool local stays tainted.
+        Returns {local_index: source_name}."""
+        tainted={}
+        changed=True
+        while changed:
+            changed=False
+            for (s,e) in blocks:
+                cur_src=None
+                for j in range(s,e):
+                    x=ins[j]; op=x["op"]
+                    if op in ("call","callvirt","newobj"):
+                        t=x.get("text")
+                        if t and any(sc in t for sc in self.SOURCE_CALLS): cur_src=t
+                    li=self._local_index(x)
+                    if li is None: continue
+                    if self._is_ldloc(op) and li in tainted:
+                        cur_src=cur_src or tainted[li]
+                    elif self._is_stloc(op):
+                        if cur_src is not None and li not in tainted:
+                            tainted[li]=cur_src; changed=True
+                        cur_src=None
+        return tainted
+
+    # Per-opcode stack effect, used to find the byte region that computes a value.
+    # None means "unknown" (an unknown-arity call): the writer refuses rather than
+    # guess, keeping the force byte-safe.
+    _CALL_DELTA={"op_Equality":-1,"op_Inequality":-1,"Equals":-1,
+                 "GetEnvironmentVariable":0,"ReadAllText":0,"ReadAllBytes":0,
+                 "ReadLine":1,"GetValue":-1}
+
+    def _call_stack_delta(self, x):
+        t=x.get("text") or ""
+        base=t.split("::")[-1].split("(")[0]
+        return self._CALL_DELTA.get(base)             # None if unknown -> refuse
+
+    def _stack_delta(self, x):
+        op=x["op"]
+        if op.startswith(("ldarg","ldloc","ldc.","ldstr","ldnull","ldsfld",
+                          "ldloca","ldarga","ldtoken","sizeof")) or op=="dup":
+            return 1
+        if op in ("nop","break"): return 0
+        if op=="pop" or op.startswith("stloc") or op.startswith("starg") or op=="stsfld":
+            return -1
+        if op=="stfld": return -2
+        if op in ("ldfld","ldflda","ldlen","not","neg","isinst","castclass","box",
+                  "unbox","unbox.any","ldobj","newarr") or op.startswith("conv."):
+            return 0
+        if op in ("add","sub","mul","div","div.un","rem","rem.un","and","or","xor",
+                  "shl","shr","shr.un","ceq","cgt","cgt.un","clt","clt.un",
+                  "ldelem.i4","ldelem.ref","ldelem.u1","ldelem.u2"):
+            return -1
+        if op in ("call","callvirt","newobj"):
+            return self._call_stack_delta(x)
+        return None                                   # branches/ret/unknown: not in a value region
+
+    def _value_region(self, ins, blocks, idx_to_block, def_idx):
+        """Byte span [start_off, stloc_off) that computes the single value stored by
+        ins[def_idx]. Returns None if it cannot be determined byte-safely (an
+        unknown-arity call in the way)."""
+        bi=idx_to_block.get(def_idx)
+        if bi is None: return None
+        s,_=blocks[bi]
+        depth=0; db={}
+        for j in range(s, def_idx+1):
+            db[j]=depth
+            d=self._stack_delta(ins[j])
+            if d is None: return None
+            depth+=d
+        if db.get(def_idx)!=1: return None            # stloc must consume exactly one
+        start=None
+        for j in range(def_idx-1, s-1, -1):
+            if db.get(j)==0: start=j; break
+        if start is None: return None
+        return (ins[start]["off"], ins[def_idx]["off"])
+
+    def _resolve_call_method(self, token):
+        """Decode the IL of the exact MethodDef a call token refers to (so an
+        overloaded helper resolves to the right body). Tests may inject a
+        {token: ins} map via self._token_methods."""
+        inj=getattr(self, "_token_methods", None)
+        if inj and token in inj: return inj[token]
+        if not isinstance(token,int) or ((token>>24)&0xff)!=0x06: return None
+        if not getattr(self, "pe", None): return None
+        try:
+            mrow=self.pe.net.mdtables.MethodDef.rows[(token & 0xffffff)-1]
+        except Exception:
+            return None
+        body=_method_body_info(self.pe, mrow)
+        if not body or not body.get("code"): return None
+        return _decode_cil(body["code"], self.pe)
+
+    _LDC={"ldc.i4.m1":-1,"ldc.i4.0":0,"ldc.i4.1":1,"ldc.i4.2":2,"ldc.i4.3":3,
+          "ldc.i4.4":4,"ldc.i4.5":5,"ldc.i4.6":6,"ldc.i4.7":7,"ldc.i4.8":8}
+
+    def _eval_il_const(self, ins, arg, max_steps=400):
+        """Concretely evaluate a small single-argument helper method on `arg`.
+        Returns the int it returns, or None if it uses an op we do not model. This
+        is what lets us resolve the force constant THROUGH a helper like Flip
+        without ever patching the helper."""
+        if not ins: return None
+        off_to_idx={x["off"]:i for i,x in enumerate(ins)}
+        st=[]; pc=0; steps=0
+        try:
+            while 0<=pc<len(ins) and steps<max_steps:
+                steps+=1; x=ins[pc]; op=x["op"]; npc=pc+1
+                if op=="nop": pc=npc; continue
+                if op in ("ldarg.0","ldarg.s","ldarg"): st.append(int(arg)); pc=npc; continue
+                if op in ("ldarg.1","ldarg.2","ldarg.3"): st.append(0); pc=npc; continue
+                if op.startswith("ldc.i4"): st.append(self._LDC.get(op, x.get("operand") or 0)); pc=npc; continue
+                if op=="neg": st.append(-st.pop()); pc=npc; continue
+                if op=="not": st.append(~st.pop()); pc=npc; continue
+                if op=="dup": st.append(st[-1]); pc=npc; continue
+                if op=="pop": st.pop(); pc=npc; continue
+                if op=="ceq": b=st.pop(); a=st.pop(); st.append(1 if a==b else 0); pc=npc; continue
+                if op in ("cgt","cgt.un"): b=st.pop(); a=st.pop(); st.append(1 if a>b else 0); pc=npc; continue
+                if op in ("clt","clt.un"): b=st.pop(); a=st.pop(); st.append(1 if a<b else 0); pc=npc; continue
+                if op in ("add","sub","mul","and","or","xor"):
+                    b=st.pop(); a=st.pop()
+                    st.append({"add":a+b,"sub":a-b,"mul":a*b,"and":a&b,"or":a|b,"xor":a^b}[op]); pc=npc; continue
+                if op in ("br.s","br"): pc=off_to_idx.get(x.get("target"),npc); continue
+                if op.startswith("brtrue"):
+                    v=st.pop(); pc=off_to_idx.get(x.get("target"),npc) if v!=0 else npc; continue
+                if op.startswith("brfalse"):
+                    v=st.pop(); pc=off_to_idx.get(x.get("target"),npc) if v==0 else npc; continue
+                if op=="ret": return st.pop() if st else 0
+                return None                               # unmodelled op -> give up
+        except Exception:
+            # Stack underflow / bad operand on a malformed or obfuscated helper:
+            # bail out and leave the force constant unresolved rather than crash.
+            return None
+        return None
+
+    def _gate_helper_chain(self, ins, block, term_idx, li):
+        """Helper method bodies the local flows THROUGH between its load and the
+        gate branch, in order (each may be None if unresolvable)."""
+        s,_=block; load=None
+        for j in range(term_idx-1, s-1, -1):
+            if self._is_ldloc(ins[j]["op"]) and self._local_index(ins[j])==li: load=j; break
+        chain=[]
+        if load is None: return chain
+        for j in range(load+1, term_idx):
+            if ins[j]["op"] in ("call","callvirt"):
+                chain.append(self._resolve_call_method(ins[j].get("operand")))
+        return chain
+
+    def _resolve_force_constant(self, ins, term_idx, licensed, chain):
+        """Pick c in {0,1} for the gate local so control reaches the licensed side,
+        composing any flow-through helper. None if it cannot be resolved."""
+        op=ins[term_idx]["op"]
+        if licensed not in ("fall-through","branch-target"): return None
+        if not op.startswith(("brtrue","brfalse")): return None
+        for c in (0,1):
+            val=c
+            for mi in chain:
+                val=self._eval_il_const(mi, val) if mi else None
+                if val is None: return None           # helper not evaluable
+            taken=(val!=0) if op.startswith("brtrue") else (val==0)
+            reached="branch-target" if taken else "fall-through"
+            if reached==licensed: return c
+        return None
+
+    def _gate_taint_candidates(self, m):
+        """Source-tainted, bool-typed, gate-only locals, with the def-site value
+        region to force, flow-through helpers, licensed side, and force constant."""
+        ins=m.get("ins") or []
+        if not ins: return []
+        blocks, off_to_idx=self._basic_blocks(ins)
+        idx_to_block={}
+        for bi,(s,e) in enumerate(blocks):
+            for j in range(s,e): idx_to_block[j]=bi
+        tainted=self._source_taint_by_local(ins, blocks)
+        if not tainted: return []
+        escaped=set(); def_idx={}; use_idx={}
+        for i,x in enumerate(ins):
+            op=x["op"]; li=self._local_index(x)
+            if li is None: continue
+            if op.startswith("ldloca"): escaped.add(li)
+            elif self._is_stloc(op): def_idx.setdefault(li,[]).append(i)
+            elif self._is_ldloc(op): use_idx.setdefault(li,[]).append(i)
+        cands=[]
+        for li, src in sorted(tainted.items()):
+            if li in escaped: continue                       # address taken; can't reason
+            defs=def_idx.get(li,[]); uses=use_idx.get(li,[])
+            if not defs or not uses: continue
+            # (b) bool-typed: at least one definition is produced by a predicate.
+            bdef=None
+            for di in defs:
+                bi=idx_to_block.get(di)
+                if bi is None: continue
+                if self._def_is_bool(ins, blocks[bi][0], di): bdef=di; break
+            if bdef is None: continue
+            # (c) gate-only: every block that LOADS the local ends in a cond branch.
+            gate_terms=[]; indirect=[]; gate_only=True
+            for ui in uses:
+                bi=idx_to_block.get(ui)
+                if bi is None: gate_only=False; break
+                s,e=blocks[bi]; term_idx=e-1
+                if not self._is_cond_branch(ins[term_idx]["op"]):
+                    gate_only=False; break
+                gate_terms.append(term_idx)
+                for j in range(ui+1, term_idx):              # helper between load and branch
+                    if ins[j]["op"] in ("call","callvirt") and ins[j].get("text"):
+                        indirect.append(ins[j]["text"])
+            if not gate_only or not gate_terms: continue
+            # licensed side + significance from the first gating branch.
+            k=gate_terms[0]; tgt=ins[k].get("target")
+            t_idx=off_to_idx.get(tgt) if isinstance(tgt,int) else None
+            licensed=None; wins=[]; sig=None
+            if t_idx is not None:
+                tscore=self._reachable_method_slice_score(m, t_idx)
+                fscore=self._reachable_method_slice_score(m, k+1)
+                licensed,_=pick_licensed(fscore["score"],"fall-through",tscore["score"],"branch-target")
+                use=fscore if licensed=="fall-through" else tscore
+                wins=use["wins"]; sig=significance(use["count"], len(ins))
+            region=self._value_region(ins, blocks, idx_to_block, bdef)
+            chain=self._gate_helper_chain(ins, blocks[idx_to_block[k]], k, li)
+            fconst=self._resolve_force_constant(ins, k, licensed, chain)
+            cands.append({"kind":"typed-local","method":m,"local":li,"source":src,
+                          "def_off":ins[bdef]["off"],"region":region,
+                          "branch_offs":[ins[t]["off"] for t in gate_terms],
+                          "indirect_via":sorted(set(indirect)),
+                          "licensed":licensed,"wins":wins,"significance":sig,
+                          "force_const":fconst})
+        return cands
+
+    def _inlined_gate_candidates(self, m):
+        """Gates whose tainted boolean is computed inline and branched on directly
+        (no stored local). There is no definition to force, so the patch target is
+        branch neutralisation -- mirroring the native (typeless) path."""
+        ins=m.get("ins") or []
+        if not ins: return []
+        blocks, off_to_idx=self._basic_blocks(ins)
+        out=[]
+        for (s,e) in blocks:
+            term=ins[e-1]
+            if not self._is_cond_branch(term["op"]): continue
+            src=None; has_bool=False; has_store=False
+            for x in ins[s:e]:
+                t=x.get("text")
+                if x["op"] in ("call","callvirt","newobj") and t and any(sc in t for sc in self.SOURCE_CALLS):
+                    src=t
+                if self._value_is_bool_producer(x): has_bool=True
+                if self._is_stloc(x["op"]): has_store=True
+            if not (src and has_bool) or has_store:      # has_store -> typed-local path owns it
+                continue
+            k=e-1; tgt=term.get("target")
+            t_idx=off_to_idx.get(tgt) if isinstance(tgt,int) else None
+            licensed=None; wins=[]; sig=None
+            if t_idx is not None:
+                tscore=self._reachable_method_slice_score(m, t_idx)
+                fscore=self._reachable_method_slice_score(m, k+1)
+                licensed,_=pick_licensed(fscore["score"],"fall-through",tscore["score"],"branch-target")
+                use=fscore if licensed=="fall-through" else tscore
+                wins=use["wins"]; sig=significance(use["count"], len(ins))
+            npops=self._branch_pop_count(term["op"])
+            if licensed=="fall-through" and npops:
+                pt=("neutralize %s @ IL_%04x (pop x%d + nop) -> fall through to licensed side"
+                    % (term["op"], term["off"], npops))
+            else:
+                pt="licensed side is the branch target; in-place neutralisation cannot force it"
+            out.append({"kind":"inlined","method":m,"source":src,"branch_off":term["off"],
+                        "locator":"inline %s @ IL_%04x"%(term["op"],term["off"]),
+                        "licensed":licensed,"wins":wins,"significance":sig,"patch_target":pt})
+        return out
+
+    def _to_neutral(self, c):
+        """Lower an internal candidate dict to the shared GateCandidate."""
+        m=c["method"]
+        if c["kind"]=="typed-local":
+            notes=[]; fv=None
+            pt=("force local %d definition at IL_%04x (one site opens every shared gate)"
+                % (c["local"], c["def_off"]))
+            if c["region"] is None:
+                notes.append("def value-region has an unknown-arity call; force write withheld")
+            if c["force_const"] is not None:
+                fv="local %d := %d" % (c["local"], c["force_const"])
+            else:
+                notes.append("force constant unresolved (helper not evaluable)")
+            return GateCandidate(backend="dotnet", unit=m["name"], kind="typed-local",
+                gate_locator="local %d (bool)"%c["local"],
+                gate_sites=["IL_%04x"%o for o in c["branch_offs"]],
+                tainted=True, source=c["source"], flows_through=c["indirect_via"],
+                licensed_side=c["licensed"], win_strings=c["wins"], significance=c["significance"],
+                patch_target=pt, force_value=fv, notes=notes)
+        return GateCandidate(backend="dotnet", unit=m["name"], kind="inlined",
+            gate_locator=c["locator"], gate_sites=["IL_%04x"%c["branch_off"]],
+            tainted=True, source=c["source"], flows_through=[],
+            licensed_side=c["licensed"], win_strings=c["wins"], significance=c["significance"],
+            patch_target=c["patch_target"], force_value=None)
+
+    def _all_gate_candidates(self, methods):
+        cands=[]
+        for m in methods:
+            cands+=self._gate_taint_candidates(m)
+            cands+=self._inlined_gate_candidates(m)
+        return cands
+
+    def _gate_taint_plan(self, methods):
+        """Non-destructive preview of the tainted-gate path, via the shared printer."""
+        cands=self._all_gate_candidates(methods)
+        return render_plan(".NET IL TAINTED-GATE PLAN (managed; preview, no bytes written)",
+                           [self._to_neutral(c) for c in cands])
+
+    def _emit_gate_forces(self, methods, out_arg=None):
+        """Write the def-site forces for byte-resolvable typed-local gates. Returns
+        (wrote, candidates). Length-preserving: the value region becomes nop padding
+        plus a single ldc.i4.<const> right before the stloc."""
+        cands=[c for m in methods for c in self._gate_taint_candidates(m)]
+        forceable=[c for c in cands
+                   if c["region"] is not None and c["force_const"] is not None]
+        if not forceable:
+            return False, cands
+        data=bytearray(_read_file_prefix(self.primary, 1<<30)); applied=0
+        for c in forceable:
+            code_off=int(c["method"]["body"]["code_off"])
+            s_off,e_off=c["region"]; foff=code_off+s_off; length=e_off-s_off
+            if length<1 or foff+length>len(data): continue
+            for j in range(length): data[foff+j]=0x00            # nop fill
+            data[foff+length-1]=0x16 if c["force_const"]==0 else 0x17  # ldc.i4.<const>
+            applied+=1
+        if not applied:
+            return False, cands
+        out=out_arg or (self.primary+".patched")
+        parent=os.path.dirname(out)
+        if parent: os.makedirs(parent, exist_ok=True)
+        with open(out,"wb") as f: f.write(data)
+        self._last_force_out=out; self._last_force_count=applied
+        return True, cands
+
+
     # --- branch-flip patching (mirrors native failure-branch neutralisation) ---
 
     def _is_cond_branch(self, op):
@@ -895,6 +1313,18 @@ class DotNetILFrontend(AnalyzerFrontend):
             print("  no IL metadata decoder available; cannot write IL patches")
             return False
         methods=self._matching_methods()
+        # Preferred: force a tainted gate local's definition. One byte-safe write
+        # opens every gate that shares it, and no overloaded helper is touched.
+        hr(".NET IL TAINTED-GATE PATCH (force gate-local definitions)")
+        wrote,cands=self._emit_gate_forces(methods, out_arg=out_arg)
+        render_plan("selected gate-local forces", [self._to_neutral(c) for c in cands],
+                    plan_only=not wrote)
+        if wrote:
+            print("  applied %d gate-local force(s); wrote %s (original untouched)"
+                  % (getattr(self,"_last_force_count",0), getattr(self,"_last_force_out","")))
+            return True
+        # Fallback: in-place branch neutralisation (inlined gates / non-forceable).
+        print("  no byte-forceable tainted gate local; falling back to branch-flip neutralisation")
         flips,skipped=self._branch_flip_targets(methods)
         return self._emit_branch_flips(flips, skipped, out_arg=out_arg)
 
