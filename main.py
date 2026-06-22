@@ -66,6 +66,17 @@ def main(argv=None) -> int:
     args = build_arg_parser().parse_args(argv)
     options = AnalyzerOptions.from_args(args)
 
+    # argparse accepts an empty string for a required positional, so an unset
+    # shell variable (`ariadne "$BINARY"`) reaches us as "". Validate up front
+    # with a clear message instead of crashing deep inside angr's loader.
+    target = args.binary
+    if not target or not target.strip():
+        print("ariadne: error: no target binary given (empty path)", file=sys.stderr)
+        return 2
+    if not os.path.isfile(target):
+        print("ariadne: error: target binary not found: %r" % target, file=sys.stderr)
+        return 2
+
     # Import angr-backed native code lazily so `--help` and pure metadata tooling
     # do not initialize angr/unicorn unless a target is actually analyzed.
     from calltree_backends.native_angr import NativeAngrFrontend, print_runtime_report
