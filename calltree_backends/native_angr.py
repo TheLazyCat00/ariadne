@@ -306,15 +306,25 @@ def recover_named(proj, cfg, mo, api, reg):
             for ins in reversed(insns):
                 dst,src=_split_ops(ins.op_str)
                 dst_n,src_n=_norm(dst),_norm(src)
-                if ins.mnemonic=="lea" and dst_n in wanted:
+                if dst_n not in wanted:
+                    continue
+                if ins.mnemonic=="lea":
                     s=_read_rip_string(ins)
                     if s: out.append(s)
                     break
                 # Track plain and width-extending register copies (mov/movsxd/
-                # movzx/movsx); ignore memory loads.
-                if ins.mnemonic.startswith("mov") and dst_n in wanted and src and "[" not in src:
+                # movzx/movsx) from another register; a memory load (src has
+                # "[") clobbers with a non-static value, so it falls through.
+                if ins.mnemonic.startswith("mov") and src and "[" not in src:
                     wanted.discard(dst_n)
                     wanted.add(src_n)
+                elif ins.mnemonic not in ("cmp","test","push"):
+                    # The tracked register is written by an instruction we can't
+                    # resolve to a static pointer (xor/add/pop/mem-load/...), so
+                    # stop tracking it rather than walk back to an unrelated lea.
+                    # cmp/test/push only read their first operand, so they don't
+                    # clobber it.
+                    wanted.discard(dst_n)
     return out
 
 def detect_sources(proj, cfg):
