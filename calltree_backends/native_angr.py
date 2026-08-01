@@ -35,6 +35,17 @@ Boundaries worth stating plainly:
     payload artifacts for a runtime-specific frontend.
 """
 import sys, logging, time
+import os, shutil, subprocess
+# Current angr spills its CFG-node and function tables to an on-disk LMDB store to
+# bound RAM on huge targets. For crackme/challenge-sized binaries that trade is
+# backwards: every `cfg.functions.values()` / node lookup then pays repeated
+# serialize+deserialize round-trips (tens of seconds of pure I/O on a statically
+# linked target, and it made source recovery re-deserialize the whole table once
+# per API). Default to the in-memory tables -- markedly faster with identical CFG
+# results on challenge-sized inputs -- while leaving an explicit override for the
+# rare multi-hundred-MB target where disk spilling is what keeps angr from OOMing.
+os.environ.setdefault("USE_SPILLING_CFGNODE_DICT", "False")
+os.environ.setdefault("USE_SPILLING_FUNCTION_DICT", "False")
 for n in ("angr","cle","pyvex","claripy","archinfo"):
     logging.getLogger(n).setLevel(logging.ERROR)
 # Missing unicorn bindings are a common, non-fatal speed-path issue in sandboxed
@@ -42,7 +53,6 @@ for n in ("angr","cle","pyvex","claripy","archinfo"):
 # the analysis result rather than an optional accelerator.
 logging.getLogger("angr.state_plugins.unicorn_engine").setLevel(logging.CRITICAL)
 import angr, claripy, networkx as nx
-import os, shutil, subprocess
 # Allow importing the backend package when this module is loaded directly rather
 # than through main.py (which already puts the workspace root on sys.path).
 for _p in (os.getcwd(), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
@@ -107,6 +117,21 @@ def is_system_module(name):
     if "/windows/system32/" in n or "/syswow64/" in n: return True
     b=n.rsplit("/",1)[-1]
     return any(s in b for s in SYS) or any(s in b for s in WIN_SYS)
+
+def node_insns(proj, node):
+    """Capstone instructions for a CFG node's block.
+
+    Passing the CFG node's known `size` is the whole point: without it,
+    `proj.factory.block(addr)` lifts the block to VEX just to discover its
+    boundary before capstone ever runs. The CFG already recovered that boundary,
+    so handing capstone the size skips the VEX lift entirely (~10x faster when
+    scanning every branch node of a large call tree). Returns [] on any failure."""
+    try:
+        size=getattr(node, "size", None)
+        blk=proj.factory.block(node.addr, size=size) if size else proj.factory.block(node.addr)
+        return blk.capstone.insns
+    except Exception:
+        return []
 
 def obj_of(proj, addr):
     """(module_basename, is_main_object) for a rebased address."""
@@ -234,7 +259,13 @@ def outcome_sinks(proj, cfg):
                 j=data.find(b"\x00",i)
                 if j==-1: break
                 s=data[i:j]
-                if 3<=len(s)<=64 and all(32<=c<127 for c in s):
+                # Accept common whitespace (tab/newline/CR) inside the string, not
+                # just the printable-ASCII range. Almost every printf/puts outcome
+                # string ends in "\n" (and some start with one, e.g. "\n[+] Access
+                # granted.\n"); requiring strictly 0x20..0x7e silently discarded the
+                # majority of real win/lose anchors, leaving string-based sink
+                # detection blind on most crackmes.
+                if 3<=len(s)<=64 and all(c in (9,10,13) or 32<=c<127 for c in s):
                     low=s.decode().lower()
                     cat=None
                     if any(w in low for w in LOSE_WORDS): cat="lose"
@@ -249,8 +280,24 @@ def outcome_sinks(proj, cfg):
 # ---------------------------------------------------------------------------
 # 3. SOURCES: input nodes (uniform; stdin always assumed). Table-driven per OS.
 # ---------------------------------------------------------------------------
-def recover_named(proj, cfg, mo, api, reg):
+def functions_by_name(cfg):
+    """One pass over the function manager, grouping functions by name.
+
+    In current angr the function table is LMDB-backed, so every
+    ``cfg.functions.values()`` deserializes all functions from disk. Recovering
+    sources touches one API name at a time, so scanning ``values()`` per API
+    re-deserialized the whole table N times (tens of seconds on a statically
+    linked binary with thousands of functions). Building the index once and
+    looking API names up in it collapses that to a single pass."""
+    idx={}
+    for f in cfg.functions.values():
+        idx.setdefault(f.name, []).append(f)
+    return idx
+
+def recover_named(proj, cfg, by_name, api, reg):
     """Recover the string passed in `reg` at each call site of `api`.
+
+    `by_name` is the index from :func:`functions_by_name` (name -> [functions]).
 
     Handles the direct `lea <argreg>, [rip+...]` shape and the very common
     one-hop register copy produced by compilers, e.g. `lea rax, [...] ; mov rdi,
@@ -261,8 +308,7 @@ def recover_named(proj, cfg, mo, api, reg):
     EVERY cfg function named `api` rather than picking one stub by address range."""
     import re
     out=[]; wide=_is_wide(api); seen=set()
-    nodes=[cfg.model.get_any_node(f.addr) for f in cfg.functions.values()
-           if f.name==api]
+    nodes=[cfg.model.get_any_node(f.addr) for f in by_name.get(api, [])]
     rip_pat=re.compile(r"\[rip\s*([+-])\s*(0x[0-9a-fA-F]+|[0-9a-fA-F]+)\]")
 
     def _split_ops(op_str):
@@ -328,12 +374,13 @@ def recover_named(proj, cfg, mo, api, reg):
     return out
 
 def detect_sources(proj, cfg):
-    mo=proj.loader.main_object; os_=target_os(proj)
+    os_=target_os(proj)
     tbl=SOURCE_TABLE.get(os_, SOURCE_TABLE["linux"])
+    by_name=functions_by_name(cfg)      # single deserialization of the LMDB table
     files=[]; envs=[]; regs=[]
-    for api,reg in tbl["file"].items():     files+=recover_named(proj,cfg,mo,api,reg)
-    for api,reg in tbl["env"].items():      envs +=recover_named(proj,cfg,mo,api,reg)
-    for api,reg in tbl["registry"].items(): regs +=recover_named(proj,cfg,mo,api,reg)
+    for api,reg in tbl["file"].items():     files+=recover_named(proj,cfg,by_name,api,reg)
+    for api,reg in tbl["env"].items():      envs +=recover_named(proj,cfg,by_name,api,reg)
+    for api,reg in tbl["registry"].items(): regs +=recover_named(proj,cfg,by_name,api,reg)
     return os_, sorted(set(files)), sorted(set(envs)), sorted(set(regs))
 
 # ---------------------------------------------------------------------------
@@ -688,16 +735,23 @@ def reverse_reachers(cfg_graph, targets):
 def find_decisions(proj, cfg, win, lose):
     """All conditional branches where one successor can reach a failure sink
     but not a win sink. Neutralizing every one of them forces success even for
-    multi-branch inline checks (e.g. an inlined strcmp)."""
+    multi-branch inline checks (e.g. an inlined strcmp).
+
+    When only a win sink is known (no failure string to anchor on -- e.g. a
+    binary whose only classified outcome is "Success!" while the reject path
+    prints something un-word-listed like "Error!"), fall back to a win-oriented
+    rule: a branch is deciding when exactly one side can still reach the win, and
+    that side is the one to force. This fallback is scoped to the no-lose case so
+    it never changes selection where failure sinks already drive it."""
     g=cfg.graph; out=[]
     can_win=reverse_reachers(g, win)
     can_lose=reverse_reachers(g, lose)
+    win_only = bool(win) and not lose
     for node in g.nodes():
         if not _is_ours(proj, node.addr): continue
         succ=list(g.successors(node))
         if len(succ)!=2: continue
-        try: insns=proj.factory.block(node.addr).capstone.insns
-        except Exception: continue
+        insns=node_insns(proj, node)
         if not insns or insns[-1].mnemonic not in ("je","jne","jz","jnz"): continue
         jmp=insns[-1]
         rw=[s in can_win for s in succ]; rl=[s in can_lose for s in succ]
@@ -705,6 +759,10 @@ def find_decisions(proj, cfg, win, lose):
         for k in (0,1):
             if rl[k] and not rw[k] and (rw[1-k] or not rl[1-k]):
                 bad=k
+        if bad is None and win_only:
+            for k in (0,1):
+                if rw[1-k] and not rw[k]:
+                    bad=k
         if bad is None: continue
         try: jtarget=int(jmp.op_str,16)
         except Exception: jtarget=None
@@ -913,8 +971,7 @@ def find_gate_dominance(proj, cfg):
         if id(node) not in our_ids: continue
         succ=list(G.successors(node))
         if len(succ)!=2: continue
-        try: insns=proj.factory.block(node.addr).capstone.insns
-        except Exception: continue
+        insns=node_insns(proj, node)
         if not insns or insns[-1].mnemonic not in ("je","jne","jz","jnz"): continue
         jmp=insns[-1]
         dA=domsize(succ[0]); dC=domsize(succ[1])
